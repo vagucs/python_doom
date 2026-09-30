@@ -2,6 +2,8 @@
 
 ![DOOM rodando em Python com pygame](screenshot/doom.png)
 
+**Vídeo:** [DOOM rodando em Python](https://youtu.be/2JdJ5zfdmkg)
+
 DOOM generic portado de Harbour para **Python 3 + pygame**.
 
 Por **Wagner Nunes da Silva**
@@ -135,6 +137,19 @@ Dependências (`requirements.txt`):
 pygame>=2.5
 numpy>=1.24
 ```
+
+---
+
+## Desempenho
+
+Taxa típica de desenho no mesmo PC (320×200, janela, IWAD shareware). O jogo continua em 35 Hz (`TICRATE`); `-fps` mostra esse número.
+
+| Port | FPS típico |
+|---|---|
+| Harbour (`doom_hb`) | ~12 |
+| Python (`doom_python`) | ~8 |
+| PHP (`php_doom`) | ~20 |
+| Node (`node_doom`) | ~100 |
 
 ---
 

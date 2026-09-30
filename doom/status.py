@@ -9,16 +9,20 @@ vagucs@gmail.com
 
 www.vagucs.com.br
 
-Status bar (st_stuff / st_lib).
+Status bar (st_stuff / st_lib), including vanilla HUD face widget.
 """
 
 from __future__ import annotations
 
+from .collision import angle_to
+from .compat import as_u32
 from .defs import (
     AM_CELL,
     AM_CLIP,
     AM_MISL,
     AM_SHELL,
+    ANG45,
+    ANG180,
     HU_FONTEND,
     HU_FONTSTART,
     IT_BLUECARD,
@@ -27,10 +31,8 @@ from .defs import (
     IT_REDSKULL,
     IT_YELLOWCARD,
     IT_YELLOWSKULL,
-    SBARHEIGHT,
-    SCREENHEIGHT,
-    SCREENWIDTH,
     CF_GODMODE,
+    TICRATE,
     WP_BFG,
     WP_CHAINGUN,
     WP_MISSILE,
@@ -53,6 +55,23 @@ ST_MAXAMMO0X, ST_MAXAMMO0Y = 314, 173
 ST_AMMO_POS = [(288, 173), (288, 179), (288, 191), (288, 185)]
 ST_MAX_POS = [(314, 173), (314, 179), (314, 191), (314, 185)]
 
+ST_NUMPAINFACES = 5
+ST_NUMSTRAIGHTFACES = 3
+ST_NUMTURNFACES = 2
+ST_NUMSPECIALFACES = 3
+ST_FACESTRIDE = ST_NUMSTRAIGHTFACES + ST_NUMTURNFACES + ST_NUMSPECIALFACES
+ST_TURNOFFSET = ST_NUMSTRAIGHTFACES
+ST_OUCHOFFSET = ST_TURNOFFSET + ST_NUMTURNFACES
+ST_EVILGRINOFFSET = ST_OUCHOFFSET + 1
+ST_RAMPAGEOFFSET = ST_EVILGRINOFFSET + 1
+ST_GODFACE = ST_NUMPAINFACES * ST_FACESTRIDE
+ST_DEADFACE = ST_GODFACE + 1
+ST_EVILGRINCOUNT = 2 * TICRATE
+ST_STRAIGHTFACECOUNT = TICRATE // 2
+ST_TURNCOUNT = TICRATE
+ST_RAMPAGEDELAY = 2 * TICRATE
+ST_MUCHPAIN = 20
+
 
 class StatusBar:
     def __init__(self, wad) -> None:
@@ -67,20 +86,140 @@ class StatusBar:
             self.keys.append(wad.cache_lump_num(n) if n >= 0 else None)
         self.armsbg = wad.cache_lump_name("STARMS") if wad.check_num_for_name("STARMS") >= 0 else None
         self.arms_off = [wad.cache_lump_name(f"STGNUM{i}") for i in range(2, 8)]
-        self.face = wad.cache_lump_name("STFST00")
+        self.fallback_face = wad.cache_lump_name("STFST00")
         self.faces = []
-        for pain in range(5):
-            n = wad.check_num_for_name(f"STFST{pain}0")
-            self.faces.append(wad.cache_lump_num(n) if n >= 0 else self.face)
-        n = wad.check_num_for_name("STFGOD0")
-        self.god_face = wad.cache_lump_num(n) if n >= 0 else self.face
-        n = wad.check_num_for_name("STFDEAD0")
-        self.dead_face = wad.cache_lump_num(n) if n >= 0 else None
+        for pain in range(ST_NUMPAINFACES):
+            for look in range(ST_NUMSTRAIGHTFACES):
+                self.faces.append(self._optional(f"STFST{pain}{look}"))
+            self.faces.append(self._optional(f"STFTR{pain}0"))
+            self.faces.append(self._optional(f"STFTL{pain}0"))
+            self.faces.append(self._optional(f"STFOUCH{pain}"))
+            self.faces.append(self._optional(f"STFEVL{pain}"))
+            self.faces.append(self._optional(f"STFKILL{pain}"))
+        self.faces.append(self._optional("STFGOD0"))
+        self.faces.append(self._optional("STFDEAD0"))
         self.font = []
         for ch in range(HU_FONTSTART, HU_FONTEND + 1):
             name = f"STCFN{ch:03d}"
             n = wad.check_num_for_name(name)
             self.font.append(wad.cache_lump_num(n) if n >= 0 else None)
+        self.reset(None)
+
+    def _optional(self, name: str):
+        n = self.wad.check_num_for_name(name)
+        return self.wad.cache_lump_num(n) if n >= 0 else None
+
+    def reset(self, player) -> None:
+        self.face_index = 0
+        self.face_count = 0
+        self.face_priority = 0
+        self.old_health = -1
+        self.pain_old_health = -1
+        self.last_calc = 0
+        self.last_attackdown = -1
+        self.old_weapons_owned = list(player.weaponowned) if player is not None else [False] * 9
+        self.rnd = 1
+
+    def ticker(self, player) -> None:
+        if player is None:
+            return
+        self.rnd = (self.rnd * 1103515245 + 12345) & 0xFFFFFFFF
+        st_random = (self.rnd >> 16) & 255
+        self._update_face_widget(player, st_random)
+        self.old_health = player.health
+
+    def _face_patch(self, index: int):
+        if 0 <= index < len(self.faces) and self.faces[index] is not None:
+            return self.faces[index]
+        return self.fallback_face
+
+    def _calc_pain_offset(self, player) -> int:
+        health = min(100, max(0, int(player.health)))
+        if health != self.pain_old_health:
+            self.last_calc = ST_FACESTRIDE * ((100 - health) * ST_NUMPAINFACES) // 101
+            self.pain_old_health = health
+        return self.last_calc
+
+    def _update_face_widget(self, player, st_random: int) -> None:
+        if self.face_priority < 10 and player.health <= 0:
+            self.face_priority = 9
+            self.face_index = ST_DEADFACE
+            self.face_count = 1
+
+        if self.face_priority < 9 and player.bonuscount:
+            do_evil_grin = False
+            n = min(len(self.old_weapons_owned), len(player.weaponowned))
+            for i in range(n):
+                if self.old_weapons_owned[i] != player.weaponowned[i]:
+                    do_evil_grin = True
+                    self.old_weapons_owned[i] = player.weaponowned[i]
+            if do_evil_grin:
+                self.face_priority = 8
+                self.face_count = ST_EVILGRINCOUNT
+                self.face_index = self._calc_pain_offset(player) + ST_EVILGRINOFFSET
+
+        if (
+            self.face_priority < 8
+            and player.damagecount
+            and getattr(player, "attacker", None) is not None
+            and player.mo is not None
+            and player.attacker is not player.mo
+        ):
+            self.face_priority = 7
+            if player.health - self.old_health > ST_MUCHPAIN:
+                self.face_count = ST_TURNCOUNT
+                self.face_index = self._calc_pain_offset(player) + ST_OUCHOFFSET
+            else:
+                badguyangle = angle_to(player.mo.x, player.mo.y, player.attacker.x, player.attacker.y)
+                if as_u32(badguyangle) > as_u32(player.mo.angle):
+                    diffang = as_u32(badguyangle - player.mo.angle)
+                    turn_right = diffang > as_u32(ANG180)
+                else:
+                    diffang = as_u32(player.mo.angle - badguyangle)
+                    turn_right = diffang <= as_u32(ANG180)
+                self.face_count = ST_TURNCOUNT
+                self.face_index = self._calc_pain_offset(player)
+                if diffang < as_u32(ANG45):
+                    self.face_index += ST_RAMPAGEOFFSET
+                elif turn_right:
+                    self.face_index += ST_TURNOFFSET
+                else:
+                    self.face_index += ST_TURNOFFSET + 1
+
+        if self.face_priority < 7 and player.damagecount:
+            if player.health - self.old_health > ST_MUCHPAIN:
+                self.face_priority = 7
+                self.face_count = ST_TURNCOUNT
+                self.face_index = self._calc_pain_offset(player) + ST_OUCHOFFSET
+            else:
+                self.face_priority = 6
+                self.face_count = ST_TURNCOUNT
+                self.face_index = self._calc_pain_offset(player) + ST_RAMPAGEOFFSET
+
+        if self.face_priority < 6:
+            if player.attackdown:
+                if self.last_attackdown == -1:
+                    self.last_attackdown = ST_RAMPAGEDELAY
+                else:
+                    self.last_attackdown -= 1
+                    if self.last_attackdown == 0:
+                        self.face_priority = 5
+                        self.face_index = self._calc_pain_offset(player) + ST_RAMPAGEOFFSET
+                        self.face_count = 1
+                        self.last_attackdown = 1
+            else:
+                self.last_attackdown = -1
+
+        if self.face_priority < 5 and (player.cheats & CF_GODMODE):
+            self.face_priority = 4
+            self.face_index = ST_GODFACE
+            self.face_count = 1
+
+        if self.face_count == 0:
+            self.face_index = self._calc_pain_offset(player) + (st_random % 3)
+            self.face_count = ST_STRAIGHTFACECOUNT
+            self.face_priority = 0
+        self.face_count -= 1
 
     def draw(self, fb: bytearray, player, show_messages: bool = True) -> None:
         draw_patch(fb, 0, 168, self.sbar)
@@ -112,17 +251,7 @@ class StatusBar:
                 self._digit(fb, x, y, i + 2, self.shortnum)
             elif i < len(self.arms_off):
                 draw_patch(fb, x, y, self.arms_off[i])
-        health = min(100, max(0, player.health))
-        pain = 0 if player.health <= 0 else min(4, ((100 - health) * 5) // 101)
-        if player.health <= 0:
-            if self.dead_face:
-                draw_patch(fb, ST_FACESX, ST_FACESY, self.dead_face)
-            elif self.faces:
-                draw_patch(fb, ST_FACESX, ST_FACESY, self.faces[-1])
-        elif player.cheats & CF_GODMODE:
-            draw_patch(fb, ST_FACESX, ST_FACESY, self.god_face)
-        elif pain < len(self.faces):
-            draw_patch(fb, ST_FACESX, ST_FACESY, self.faces[pain])
+        draw_patch(fb, ST_FACESX, ST_FACESY, self._face_patch(self.face_index))
         key_slots = [
             (IT_BLUECARD, IT_BLUESKULL, 0),
             (IT_YELLOWCARD, IT_YELLOWSKULL, 1),
@@ -151,7 +280,6 @@ class StatusBar:
     def _num(self, fb, x, y, value, digits, font) -> None:
         w, _, _, _ = patch_size(font[0])
         x -= w
-        neg = value < 0
         value = abs(int(value))
         for _ in range(digits):
             draw_patch(fb, x, y, font[value % 10])

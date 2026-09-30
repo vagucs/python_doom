@@ -217,6 +217,7 @@ class Game:
             player.damagecount += damage
             if player.damagecount > 100:
                 player.damagecount = 100
+            player.attacker = source
             if player.health <= 0:
                 player.health = 0
                 player.playerstate = PST_DEAD
@@ -265,6 +266,8 @@ class Game:
         self.finale = None
         self.sound.play_level_music(self.episode, self.mapn)
         self.automap.reset_level()
+        if self.status:
+            self.status.reset(self.player)
         print(f"Entering E{self.episode}M{self.mapn}")
 
     def _carry_player(self, prev) -> None:
@@ -389,6 +392,8 @@ class Game:
         self._st_palette = -1
         self.keys.clear()
         self.automap.reset_level()
+        if self.status:
+            self.status.reset(self.player)
         if self.player:
             self.player.set_message("game loaded.")
         print(f"Loaded E{self.episode}M{self.mapn}")
@@ -497,6 +502,8 @@ class Game:
                 return
         self.leveltime += 1
         self.automap.ticker(self)
+        if self.status:
+            self.status.ticker(self.player)
 
     def draw(self) -> None:
         fb = self.video.fb

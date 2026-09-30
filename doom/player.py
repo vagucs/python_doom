@@ -152,6 +152,7 @@ class Player:
     usedown: bool = False
     damagecount: int = 0
     bonuscount: int = 0
+    attacker: object | None = None
     extralight: int = 0
     refire: int = 0
     killcount: int = 0

@@ -229,6 +229,9 @@ class Menu:
         if key == pygame.K_F3:
             self._do_action("loadgame", 0)
             return True
+        if key == pygame.K_F1:
+            self._open_help()
+            return True
 
         if not self.active:
             if key == pygame.K_ESCAPE:
@@ -377,6 +380,16 @@ class Menu:
         elif action == "skill":
             self.game.start_new_game(choice, self.epi + 1, 1)
             self.clear()
+
+    def _open_help(self) -> None:
+        """F1 / key_menu_help: ReadDef1 (HELP2 no shareware 1.9)."""
+        self.active = True
+        self.message = None
+        self.save_string_enter = False
+        self.menus["read1"].last_on = 0
+        self.screen = "read1"
+        self.item_on = 0
+        self.sound.play("swtchn")
 
     def _goto(self, name: str) -> None:
         self.menus[self.screen].last_on = self.item_on

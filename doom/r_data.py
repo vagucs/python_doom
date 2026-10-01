@@ -89,8 +89,8 @@ class Resources:
     def colormap(self, level: int) -> bytes:
         if level < 0:
             level = 0
-        if level > 31:
-            level = 31
+        if level > 32:
+            level = 32
         off = level * 256
         return self.colormaps[off : off + 256]
 

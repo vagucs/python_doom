@@ -67,6 +67,7 @@ class Sound:
         self.wad: Optional[Wad] = None
         self._cache: dict[str, Optional[pygame.mixer.Sound]] = {}
         self.enabled = True
+        self.music_enabled = True
         self._init = False
         self._freq = 11025
         self._channels = 1
@@ -122,8 +123,13 @@ class Sound:
             name = f"e{episode}m{mapn}"
         self.change_music(name, looping=True)
 
-    def change_music(self, name: str, looping: bool = True) -> None:
+    def has_music(self, name: str) -> bool:
         if not self.wad or not name:
+            return False
+        return self.wad.check_num_for_name("D_" + name.upper()[:6]) >= 0
+
+    def change_music(self, name: str, looping: bool = True) -> None:
+        if not self.music_enabled or not self.wad or not name:
             return
         if name.lower() == self._music_name:
             return

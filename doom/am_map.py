@@ -25,6 +25,7 @@ from .defs import (
     ML_MAPPED,
     ML_SECRET,
     PLAYER_RADIUS,
+    PW_ALLMAP,
     SBARHEIGHT,
     SCREENHEIGHT,
     SCREENWIDTH,
@@ -634,6 +635,8 @@ class Automap:
                     self._draw_mline(ax, ay, bx, by, CDWALLCOLORS + self.lightlev)
                 elif self.cheating:
                     self._draw_mline(ax, ay, bx, by, TSWALLCOLORS + self.lightlev)
+            elif game.player.powers[PW_ALLMAP] and not (line.flags & LINE_NEVERSEE):
+                self._draw_mline(ax, ay, bx, by, GRAYS + 3)
 
     def _rotate(self, x: int, y: int, a: int) -> tuple[int, int]:
         n_fine = ushr(as_u32(a), ANGLETOFINESHIFT)

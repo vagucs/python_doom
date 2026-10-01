@@ -158,7 +158,8 @@ class World:
         self.blockmap: list[int] = []
         self.bmaporgx = self.bmaporgy = 0
         self.bmapwidth = self.bmapheight = 0
-        self.blockmaplump: bytes = b""
+        self.blockmaplump: list = []
+        self.blocklinks: list = []
         self.validcount = 0
         self.mobjs: list = []
         self.rejectmatrix: bytes = b""
@@ -332,13 +333,20 @@ class World:
             )
 
     def _load_blockmap(self, data: bytes) -> None:
-        self.blockmaplump = data
-        if len(data) < 8:
+        n = len(data) // 2
+        lump = [int.from_bytes(data[i * 2 : i * 2 + 2], "little", signed=False) for i in range(n)]
+        self.blockmaplump = lump
+        self.blockmap = []
+        self.blocklinks = []
+        if n < 4:
             return
         self.bmaporgx = _i16(data, 0) * FRACUNIT
         self.bmaporgy = _i16(data, 2) * FRACUNIT
         self.bmapwidth = _i16(data, 4)
         self.bmapheight = _i16(data, 6)
+        count = self.bmapwidth * self.bmapheight
+        self.blockmap = lump[4 : 4 + count]
+        self.blocklinks = [None] * count
 
     def _load_reject(self, data: bytes) -> None:
         self.rejectmatrix = data or b""

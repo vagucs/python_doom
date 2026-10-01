@@ -126,6 +126,7 @@ class Renderer:
         self.viewx = self.viewy = self.viewz = self.viewangle = 0
         self.viewcos = self.viewsin = 0
         self.extralight = 0
+        self.fixedcolormap = None
         self.curline = None
         self.frontsector = None
         self.backsector = None
@@ -286,13 +287,14 @@ class Renderer:
             scale = 64 * FRACUNIT
         return scale
 
-    def setup_frame(self, x: int, y: int, z: int, angle: int, extra_light: int = 0) -> None:
+    def setup_frame(self, x: int, y: int, z: int, angle: int, extra_light: int = 0, fixedcolormap: int = 0) -> None:
         from .tables import fine_cos, fine_sin
         self.viewx, self.viewy, self.viewz = x, y, z
         self.viewangle = as_u32(angle)
         self.viewsin = fine_sin(self.viewangle)
         self.viewcos = fine_cos(self.viewangle)
         self.extralight = extra_light
+        self.fixedcolormap = self.res.colormap(fixedcolormap) if fixedcolormap else None
         # R_ClearPlanes: scale of the view plane at 90° to the view
         ang = ushr(as_u32(self.viewangle - ANG90), ANGLETOFINESHIFT) & FINEMASK
         self.basexscale = fixed_div(finesine[(ang + FINEANGLES // 4) & FINEMASK], self.centerxfrac or 1)
@@ -709,7 +711,7 @@ class Renderer:
                 index = ushr(self.rw_scale, LIGHTSCALESHIFT)
                 if index >= MAXLIGHTSCALE:
                     index = MAXLIGHTSCALE - 1
-                self.dc_colormap = self.res.colormap(self.walllights[index])
+                self.dc_colormap = self.fixedcolormap or self.res.colormap(self.walllights[index])
                 self.dc_x = self.rw_x
                 self.dc_iscale = (0xFFFFFFFF // self.rw_scale) if self.rw_scale else 0
             if self.midtexture:
@@ -836,7 +838,7 @@ class Renderer:
                 index = ushr(spryscale, LIGHTSCALESHIFT) if spryscale > 0 else 0
                 if index >= MAXLIGHTSCALE:
                     index = MAXLIGHTSCALE - 1
-                self.dc_colormap = self.res.colormap(walllights[index])
+                self.dc_colormap = self.fixedcolormap or self.res.colormap(walllights[index])
                 self.dc_x = dc_x
                 self.dc_iscale = (0xFFFFFFFF // spryscale) if spryscale else 0
                 self.dc_texturemid = dc_texturemid
@@ -916,7 +918,7 @@ class Renderer:
                     ds_xfrac = self.viewx + fixed_mul(finesine[(ang + FINEANGLES // 4) & FINEMASK], length)
                     ds_yfrac = -self.viewy - fixed_mul(finesine[ang], length)
                     index = min(MAXLIGHTZ - 1, ushr(distance, LIGHTZSHIFT))
-                    cm = self.res.colormap(planezlight[index])
+                    cm = self.fixedcolormap or self.res.colormap(planezlight[index])
                     # R_DrawSpan: xtemp = xfrac>>16, ytemp = (yfrac>>10)&0x0FC0
                     spot = ((ds_xfrac >> 16) & 63) | ((ds_yfrac >> 10) & 0x0FC0)
                     pix = cm[flat[spot] if spot < len(flat) else 0]

@@ -24,6 +24,7 @@ from .defs import (
     FINEMASK,
     FRACBITS,
     FRACUNIT,
+    MF_SHADOW,
     SCREENWIDTH,
     SIL_BOTTOM,
     SIL_TOP,
@@ -37,6 +38,12 @@ LOWERSPEED = 6 * FRACUNIT
 RAISESPEED = 6 * FRACUNIT
 
 MINZ = 4 * FRACUNIT
+# Harbour r_draw.prg: ±SCREENWIDTH offsets, colormap 6 (R_DrawFuzzColumn).
+_FUZZ_DIR = (
+    1, -1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1, 1, -1, 1, 1, 1, -1, -1, -1, -1, 1, -1, -1, 1,
+    1, 1, 1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, -1, -1, -1, 1, 1, 1, 1, -1, 1, 1, -1, 1,
+)
+_fuzzpos = 0
 MAX_SPRITE_FRAMES = 29
 
 
@@ -119,7 +126,7 @@ def lookup_sprite(res, name: str, ang_to_thing: int, moangle: int, frame: int) -
     sprframes = frames.get(base)
     if not sprframes:
         return None
-    fi = frame & 31
+    fi = frame & 0x7FFF
     if fi >= len(sprframes):
         return None
     sf = sprframes[fi]
@@ -343,7 +350,12 @@ def _draw_sprite(renderer, fb, spr, clip_walls: bool = True) -> None:
         cliptop = [-1] * SCREENWIDTH
         clipbot = [renderer.viewheight] * SCREENWIDTH
     colofs = [struct.unpack_from("<I", patch, 8 + c * 4)[0] for c in range(max(1, patch_w))]
-    cm = renderer.res.colormap(0)
+    mo = spr.get("mo")
+    fuzz = mo is not None and (getattr(mo, "flags", 0) & MF_SHADOW)
+    if fuzz:
+        cm = renderer.res.colormap(6)
+    else:
+        cm = renderer.fixedcolormap or renderer.res.colormap(0)
     ylookup = renderer.ylookup
     frac = spr["startfrac"]
     for x in range(spr["x1"], spr["x2"] + 1):
@@ -368,22 +380,45 @@ def _draw_sprite(renderer, fb, spr, clip_walls: bool = True) -> None:
                     yl = 0
                 if yh >= renderer.viewheight:
                     yh = renderer.viewheight - 1
+                if fuzz:
+                    if yl <= 0:
+                        yl = 1
+                    if yh >= renderer.viewheight - 1:
+                        yh = renderer.viewheight - 2
                 if yl <= yh:
                     texfrac = fixed_mul((yl << FRACBITS) - topscreen, y_iscale)
                     if texfrac < 0:
                         texfrac = 0
                     for y in range(yl, yh + 1):
-                        idx = texfrac >> FRACBITS
-                        if 0 <= idx < length:
-                            pix = patch[source + idx]
-                            val = cm[pix] if pix < len(cm) else pix
-                            if renderer.detailshift:
-                                xx = x << 1
-                                off = ylookup[y] + renderer.columnofs[xx]
-                                fb[off] = val
-                                fb[off + 1] = val
-                            else:
-                                fb[ylookup[y] + renderer.columnofs[x]] = val
+                        if fuzz:
+                            _draw_fuzz_pixel(renderer, fb, x, y, cm)
+                        else:
+                            idx = texfrac >> FRACBITS
+                            if 0 <= idx < length:
+                                pix = patch[source + idx]
+                                val = cm[pix] if pix < len(cm) else pix
+                                if renderer.detailshift:
+                                    xx = x << 1
+                                    off = ylookup[y] + renderer.columnofs[xx]
+                                    fb[off] = val
+                                    fb[off + 1] = val
+                                else:
+                                    fb[ylookup[y] + renderer.columnofs[x]] = val
                         texfrac += y_iscale
                 column += length + 4
         frac += iscale
+
+
+def _draw_fuzz_pixel(renderer, fb, x: int, y: int, cm) -> None:
+    """R_DrawFuzzColumn: sample a neighbour and map through COLORMAP 6."""
+    global _fuzzpos
+    dest = renderer.ylookup[y] + renderer.columnofs[(x << 1) if renderer.detailshift else x]
+    src = dest + _FUZZ_DIR[_fuzzpos] * SCREENWIDTH
+    _fuzzpos = (_fuzzpos + 1) % len(_FUZZ_DIR)
+    if src < 0 or src >= len(fb):
+        src = dest
+    pix = fb[src] & 255
+    val = cm[pix] if pix < len(cm) else pix
+    fb[dest] = val
+    if renderer.detailshift and dest + 1 < len(fb):
+        fb[dest + 1] = val

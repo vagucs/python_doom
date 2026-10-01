@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .collision import line_attack, point_in_subsector, slide_move, use_lines
+from .collision import angle_to, bullet_slope, line_attack, point_in_subsector, slide_move, use_lines
 from .compat import as_u32, fixed_mul
 from .defs import (
     AM_CELL,
@@ -24,6 +24,7 @@ from .defs import (
     AM_MISL,
     AM_SHELL,
     ANG90,
+    ANG180,
     BT_ATTACK,
     BT_CHANGE,
     BT_USE,
@@ -33,18 +34,31 @@ from .defs import (
     FRACUNIT,
     FRICTION,
     GRAVITY,
+    INFRATICS,
+    INVERSECOLORMAP,
+    INVISTICS,
+    INVULNTICS,
+    IRONTICS,
     MAXBOB,
+    MAXHEALTH,
     MELEERANGE,
     MISSILERANGE,
     MF_DROPOFF,
     MF_NOCLIP,
     MF_PICKUP,
+    MF_SHADOW,
     MF_SHOOTABLE,
     MF_SOLID,
     PLAYER_HEIGHT,
     PLAYER_RADIUS,
     PST_DEAD,
     PST_LIVE,
+    PST_REBORN,
+    PW_INFRARED,
+    PW_INVISIBILITY,
+    PW_INVULNERABILITY,
+    PW_IRONFEET,
+    PW_STRENGTH,
     STOPSPEED,
     TICRATE,
     VIEWHEIGHT,
@@ -100,6 +114,7 @@ class Mobj:
     info: object | None = None
     alive: bool = True
     reactiontime: int = 0
+    lastlook: int = 0
     target: object | None = None
     movedir: int = 8
     movecount: int = 0
@@ -109,6 +124,14 @@ class Mobj:
     chase_tics: int = 0
     just_attacked: bool = False
     damage: int = 0
+    missile_kind: str = ""
+    tracer: object | None = None
+    istate: int = 0
+    spawnpoint: object | None = None
+    doomednum: int = -1
+    bnext: object | None = None
+    bprev: object | None = None
+    blocklinked: bool = False
 
     @property
     def _tmx(self) -> int:
@@ -154,6 +177,7 @@ class Player:
     bonuscount: int = 0
     attacker: object | None = None
     extralight: int = 0
+    fixedcolormap: int = 0
     refire: int = 0
     killcount: int = 0
     itemcount: int = 0
@@ -167,10 +191,42 @@ class Player:
     psprite_body: str = ""
     psprite_flash: str = ""
     flash_tics: int = 0
+    powers: list = field(default_factory=lambda: [0] * 6)
 
     def set_message(self, text: str) -> None:
-        self.message = text
+        from .deh import deh_string
+
+        self.message = deh_string(text)
         self.message_tics = 4 * TICRATE
+
+
+def give_power(player: Player, power: int) -> bool:
+    """P_GivePower: timed powers refresh; allmap is once-only."""
+    if power == PW_INVULNERABILITY:
+        player.powers[power] = INVULNTICS
+        return True
+    if power == PW_INVISIBILITY:
+        player.powers[power] = INVISTICS
+        if player.mo is not None:
+            player.mo.flags |= MF_SHADOW
+        return True
+    if power == PW_INFRARED:
+        player.powers[power] = INFRATICS
+        return True
+    if power == PW_IRONFEET:
+        player.powers[power] = IRONTICS
+        return True
+    if power == PW_STRENGTH:
+        if player.health < MAXHEALTH:
+            player.health = min(MAXHEALTH, player.health + 100)
+            if player.mo is not None:
+                player.mo.health = player.health
+        player.powers[power] = 1
+        return True
+    if player.powers[power]:
+        return False
+    player.powers[power] = 1
+    return True
 
 
 def spawn_player(world, start, cheats: int = 0) -> Player:
@@ -185,10 +241,22 @@ def spawn_player(world, start, cheats: int = 0) -> Player:
     )
     player = Player(mo=mo, cheats=cheats)
     mo.player = player
+    from .deh import deh
+
+    player.health = deh.initial_health
+    mo.health = deh.initial_health
+    player.ammo = [deh.initial_bullets, 0, 0, 0]
+    player.maxammo = list(deh.maxammo)
     if cheats & 1:
         mo.flags |= MF_NOCLIP
     player.viewz = mo.z + VIEWHEIGHT
+    from .enemy import p_random
+
+    mo.lastlook = p_random() % 4
     world.mobjs.append(mo)
+    from .collision import set_thing_position
+
+    set_thing_position(world, mo)
     return player
 
 
@@ -231,28 +299,15 @@ def calc_height(player: Player, leveltime: int) -> None:
 
 
 def xy_movement(world, mo: Mobj, game) -> None:
-    if mo.momx == 0 and mo.momy == 0:
-        return
-    slide_move(world, mo, mo.momx, mo.momy, game)
-    if mo.player and abs(mo.momx) < STOPSPEED and abs(mo.momy) < STOPSPEED:
-        cmd = mo.player.cmd
-        if cmd.forwardmove == 0 and cmd.sidemove == 0:
-            mo.momx = mo.momy = 0
-            return
-    mo.momx = fixed_mul(mo.momx, FRICTION)
-    mo.momy = fixed_mul(mo.momy, FRICTION)
+    from .enemy import p_xy_movement
+
+    p_xy_movement(world, mo, game)
 
 
-def z_movement(mo: Mobj) -> None:
-    mo.z += mo.momz
-    if mo.z <= mo.floorz:
-        mo.z = mo.floorz
-        mo.momz = 0
-    else:
-        mo.momz -= GRAVITY
-    if mo.z + mo.height > mo.ceilingz:
-        mo.z = mo.ceilingz - mo.height
-        mo.momz = 0
+def z_movement(mo: Mobj, world=None, game=None) -> None:
+    from .enemy import mobj_z
+
+    mobj_z(mo, world, game)
 
 
 def _special_sector(world, player: Player, game, leveltime: int) -> None:
@@ -269,6 +324,8 @@ def _special_sector(world, player: Player, game, leveltime: int) -> None:
         sector.special = 0
         return
     if spec in (5, 7, 4, 16, 11):
+        if player.powers[3]:
+            return
         if (leveltime & 0x1F) != 0:
             return
         if spec == 5:
@@ -283,20 +340,43 @@ def _special_sector(world, player: Player, game, leveltime: int) -> None:
                 game.specials.exit_requested = True
 
 
+def _death_think(world, player: Player, game, leveltime: int) -> None:
+    mo = player.mo
+    assert mo is not None
+    cmd = player.cmd
+    if player.viewheight > 6 * FRACUNIT:
+        player.viewheight -= FRACUNIT
+    if player.viewheight < 6 * FRACUNIT:
+        player.viewheight = 6 * FRACUNIT
+    player.deltaviewheight = 0
+    xy_movement(world, mo, game)
+    z_movement(mo, world, game)
+    calc_height(player, leveltime)
+    if player.attacker is not None and player.attacker is not mo:
+        angle = angle_to(mo.x, mo.y, player.attacker.x, player.attacker.y)
+        delta = as_u32(angle - mo.angle)
+        ang5 = ANG90 // 18
+        if delta < as_u32(ang5) or delta > as_u32(-ang5):
+            mo.angle = angle
+            if player.damagecount:
+                player.damagecount -= 1
+        elif delta < as_u32(ANG180):
+            mo.angle = as_u32(mo.angle + ang5)
+        else:
+            mo.angle = as_u32(mo.angle - ang5)
+    elif player.damagecount:
+        player.damagecount -= 1
+    _weapon_think(player, game)
+    if cmd.buttons & BT_USE:
+        player.playerstate = PST_REBORN
+
+
 def player_think(world, player: Player, game, leveltime: int) -> None:
     mo = player.mo
     assert mo is not None
     cmd = player.cmd
     if player.playerstate == PST_DEAD:
-        if player.viewheight > 6 * FRACUNIT:
-            player.viewheight -= FRACUNIT
-        calc_height(player, leveltime)
-        if cmd.buttons & BT_USE:
-            player.playerstate = PST_LIVE
-            player.health = 100
-            mo.health = 100
-            mo.alive = True
-            mo.flags |= MF_SHOOTABLE | MF_SOLID
+        _death_think(world, player, game, leveltime)
         return
     mo.angle = as_u32(mo.angle + (cmd.angleturn << 16))
     onground = mo.z <= mo.floorz
@@ -305,7 +385,7 @@ def player_think(world, player: Player, game, leveltime: int) -> None:
     if cmd.sidemove and onground:
         thrust(mo, as_u32(mo.angle - ANG90), cmd.sidemove * 2048)
     xy_movement(world, mo, game)
-    z_movement(mo)
+    z_movement(mo, world, game)
     calc_height(player, leveltime)
     _special_sector(world, player, game, leveltime)
     if cmd.buttons & BT_USE:
@@ -319,6 +399,26 @@ def player_think(world, player: Player, game, leveltime: int) -> None:
         if 0 <= neww <= WP_SUPERSHOTGUN and player.weaponowned[neww] and neww != player.readyweapon:
             player.pendingweapon = neww
     _weapon_think(player, game)
+    if player.powers[PW_STRENGTH]:
+        player.powers[PW_STRENGTH] += 1
+    if player.powers[PW_INVULNERABILITY]:
+        player.powers[PW_INVULNERABILITY] -= 1
+    if player.powers[PW_INVISIBILITY]:
+        player.powers[PW_INVISIBILITY] -= 1
+        if player.powers[PW_INVISIBILITY] == 0 and player.mo is not None:
+            player.mo.flags &= ~MF_SHADOW
+    if player.powers[PW_INFRARED]:
+        player.powers[PW_INFRARED] -= 1
+    if player.powers[PW_IRONFEET]:
+        player.powers[PW_IRONFEET] -= 1
+    inv = player.powers[PW_INVULNERABILITY]
+    ir = player.powers[PW_INFRARED]
+    if inv:
+        player.fixedcolormap = INVERSECOLORMAP if inv > 4 * 32 or (inv & 8) else 0
+    elif ir:
+        player.fixedcolormap = 1 if ir > 4 * 32 or (ir & 8) else 0
+    else:
+        player.fixedcolormap = 0
     if player.damagecount:
         player.damagecount -= 1
     if player.bonuscount:
@@ -457,20 +557,25 @@ WEAPON_READY = {
 
 
 def _weapon_think(player: Player, game) -> None:
+    if player.playerstate == PST_DEAD or player.health <= 0:
+        _lower_weapon(player, game)
+        return
     cmd = player.cmd
     firing = bool(cmd.buttons & BT_ATTACK)
     ammo_type = WEAPON_AMMO.get(player.readyweapon)
     can_fire = True
-    if ammo_type is not None and player.ammo[ammo_type] <= 0:
+    need = _ammo_needed(player.readyweapon)
+    if ammo_type is not None and player.ammo[ammo_type] < need:
         can_fire = player.readyweapon in (WP_FIST, WP_CHAINSAW)
         if not can_fire:
             for w in (WP_PISTOL, WP_SHOTGUN, WP_CHAINGUN, WP_MISSILE, WP_PLASMA, WP_BFG, WP_FIST):
                 at = WEAPON_AMMO.get(w)
-                if player.weaponowned[w] and (at is None or player.ammo[at] > 0):
+                wneed = _ammo_needed(w)
+                if player.weaponowned[w] and (at is None or player.ammo[at] >= wneed):
                     player.pendingweapon = w
                     break
             ammo_type = WEAPON_AMMO.get(player.readyweapon)
-            can_fire = ammo_type is None or player.ammo[ammo_type] > 0
+            can_fire = ammo_type is None or player.ammo[ammo_type] >= _ammo_needed(player.readyweapon)
     if player.flash_tics > 0:
         player.flash_tics -= 1
         if player.flash_tics <= 0:
@@ -521,6 +626,8 @@ def _lower_weapon(player: Player, game) -> None:
     if player.psprite_sy < WEAPONBOTTOM:
         return
     player.psprite_sy = WEAPONBOTTOM
+    if player.playerstate == PST_DEAD or player.health <= 0:
+        return
     if player.pendingweapon != WP_NOCHANGE:
         player.readyweapon = player.pendingweapon
         player.pendingweapon = WP_NOCHANGE
@@ -601,36 +708,88 @@ def _enter_atk_step(player: Player, game, ammo_type, firing: bool, can_fire: boo
         player.psprite_step += 1
 
 
+def _ammo_needed(weapon: int) -> int:
+    if weapon == WP_BFG:
+        from .deh import deh
+
+        return deh.bfg_cells_per_shot
+    return 1
+
+
+def _gun_shot(player: Player, game, accurate: bool) -> bool:
+    """P_GunShot."""
+    from .enemy import p_random
+
+    mo = player.mo
+    slope = bullet_slope(game.world, mo)
+    damage = 5 * ((p_random() % 3) + 1)
+    angle = mo.angle
+    if not accurate:
+        angle = as_u32(angle + (p_random() - p_random()) * 262144)
+    return line_attack(game.world, mo, damage, game, MISSILERANGE, angle, slope)
+
+
 def _do_shot(player: Player, game, ammo_type) -> None:
+    need = _ammo_needed(player.readyweapon)
     if ammo_type is not None:
-        if player.ammo[ammo_type] <= 0:
+        if player.ammo[ammo_type] < need:
             return
-        player.ammo[ammo_type] -= 1
-    dmg, rng, sfx = WEAPON_SHOT.get(player.readyweapon, (5, MISSILERANGE, "pistol"))
+        player.ammo[ammo_type] -= need
+    from .enemy import noise_alert, p_random, spawn_player_missile
+
+    mo = player.mo
+    weapon = player.readyweapon
     hit = False
-    if player.mo:
-        pellets = 7 if player.readyweapon == WP_SHOTGUN else 20 if player.readyweapon == WP_SUPERSHOTGUN else 1
-        if player.readyweapon == WP_CHAINSAW:
-            shot = 2 * ((game.leveltime % 10) + 1)
-            rng = MELEERANGE + 1
-            pellets = 1
+    if mo and weapon in (WP_MISSILE, WP_PLASMA, WP_BFG):
+        if weapon == WP_PLASMA:
+            _ = p_random() & 1
+        if weapon == WP_MISSILE:
+            spawn_player_missile(game.world, mo, "MISL", 20 * FRACUNIT, 20, "rocket")
+            game.start_sound("rlaunc")
+        elif weapon == WP_PLASMA:
+            spawn_player_missile(game.world, mo, "PLSS", 25 * FRACUNIT, 5, "plasma")
+            game.start_sound("plasma")
         else:
-            shot = dmg * ((game.leveltime & 7) + 1)
-        for _ in range(pellets):
-            if line_attack(game.world, player.mo, shot, game, rng):
-                hit = True
-    if player.readyweapon == WP_CHAINSAW:
-        game.start_sound("sawhit" if hit else "sawful")
-    elif player.readyweapon == WP_FIST:
+            spawn_player_missile(game.world, mo, "BFS1", 25 * FRACUNIT, 100, "bfg")
+            game.start_sound("bfg")
+        player.refire += 1
+        player.attackdown = True
+        noise_alert(game.world, mo, game)
+        return
+    if mo and weapon == WP_FIST:
+        damage = ((p_random() % 10) + 1) * 2
+        if player.powers[PW_STRENGTH]:
+            damage *= 10
+        angle = as_u32(mo.angle + (p_random() - p_random()) * 262144)
+        hit = line_attack(game.world, mo, damage, game, MELEERANGE, angle)
         if hit:
             game.start_sound("punch")
-    elif sfx:
-        game.start_sound(sfx)
+    elif mo and weapon == WP_CHAINSAW:
+        damage = 2 * ((p_random() % 10) + 1)
+        angle = as_u32(mo.angle + (p_random() - p_random()) * 262144)
+        hit = line_attack(game.world, mo, damage, game, MELEERANGE + 1, angle)
+        game.start_sound("sawhit" if hit else "sawful")
+    elif mo and weapon == WP_SHOTGUN:
+        game.start_sound("shotgn")
+        for _ in range(7):
+            if _gun_shot(player, game, False):
+                hit = True
+    elif mo and weapon == WP_SUPERSHOTGUN:
+        game.start_sound("dshtgn")
+        slope = bullet_slope(game.world, mo)
+        for _ in range(20):
+            damage = 5 * ((p_random() % 3) + 1)
+            angle = as_u32(mo.angle + (p_random() - p_random()) * 524288)
+            pellet = slope + (p_random() - p_random()) * 32
+            if line_attack(game.world, mo, damage, game, MISSILERANGE, angle, pellet):
+                hit = True
+    elif mo:
+        game.start_sound("pistol")
+        _gun_shot(player, game, player.refire == 0)
     player.refire += 1
     player.attackdown = True
-    from .enemy import noise_alert
-
-    noise_alert(game.world, player.mo, game)
+    if mo:
+        noise_alert(game.world, mo, game)
 
 
 def weapon_patch(player: Player) -> str:

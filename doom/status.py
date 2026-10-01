@@ -32,6 +32,7 @@ from .defs import (
     IT_YELLOWCARD,
     IT_YELLOWSKULL,
     CF_GODMODE,
+    PW_INVULNERABILITY,
     TICRATE,
     WP_BFG,
     WP_CHAINGUN,
@@ -210,7 +211,7 @@ class StatusBar:
             else:
                 self.last_attackdown = -1
 
-        if self.face_priority < 5 and (player.cheats & CF_GODMODE):
+        if self.face_priority < 5 and ((player.cheats & CF_GODMODE) or player.powers[PW_INVULNERABILITY]):
             self.face_priority = 4
             self.face_index = ST_GODFACE
             self.face_count = 1

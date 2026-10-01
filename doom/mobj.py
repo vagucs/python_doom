@@ -35,10 +35,21 @@ from .defs import (
     MF_AMBUSH,
     MF_COUNTITEM,
     MF_COUNTKILL,
+    MF_FLOAT,
+    MF_NOBLOCKMAP,
+    MF_NOGRAVITY,
+    MF_SPAWNCEILING,
+    MF_NOSECTOR,
     MF_PICKUP,
+    MF_SHADOW,
     MF_SHOOTABLE,
     MF_SOLID,
     MF_SPECIAL,
+    PW_ALLMAP,
+    PW_INFRARED,
+    PW_INVISIBILITY,
+    PW_INVULNERABILITY,
+    PW_IRONFEET,
     SK_BABY,
     SK_EASY,
     SK_HARD,
@@ -47,12 +58,13 @@ from .defs import (
     WP_BFG,
     WP_CHAINGUN,
     WP_CHAINSAW,
+    WP_FIST,
     WP_MISSILE,
     WP_PLASMA,
     WP_SHOTGUN,
     WP_SUPERSHOTGUN,
 )
-from .player import CLIPAMMO, Mobj
+from .player import CLIPAMMO, Mobj, give_power
 
 # type -> (sprite, radius_mapunits, height_mapunits, health, flags, kind, extra)
 # kind: enemy, item, deco, weapon, ammo, key, health, armor
@@ -62,9 +74,11 @@ INFO = {
     9: ("SPOSA1", 20, 56, 30, MF_SOLID | MF_SHOOTABLE, "enemy", "posit1"),
     3001: ("TROOA1", 20, 56, 60, MF_SOLID | MF_SHOOTABLE, "enemy", "bgsit1"),
     3002: ("SARGA1", 30, 56, 150, MF_SOLID | MF_SHOOTABLE, "enemy", "sgtsit"),
+    58: ("SARGA1", 30, 56, 150, MF_SOLID | MF_SHOOTABLE | MF_SHADOW, "enemy", "sgtsit"),
+    65: ("CPOSA1", 20, 56, 70, MF_SOLID | MF_SHOOTABLE, "enemy", "posit2"),
     3003: ("BOSSA1", 24, 64, 1000, MF_SOLID | MF_SHOOTABLE, "enemy", "brssit"),
-    3005: ("HEADA1", 31, 56, 400, MF_SOLID | MF_SHOOTABLE, "enemy", "cacsit"),
-    3006: ("SKULA1", 16, 56, 100, MF_SOLID | MF_SHOOTABLE, "enemy", "sklatk"),
+    3005: ("HEADA1", 31, 56, 400, MF_SOLID | MF_SHOOTABLE | MF_FLOAT | MF_NOGRAVITY, "enemy", "cacsit"),
+    3006: ("SKULA1", 16, 56, 100, MF_SOLID | MF_SHOOTABLE | MF_FLOAT | MF_NOGRAVITY, "enemy", "sklatk"),
     16: ("CYBRA1", 40, 110, 4000, MF_SOLID | MF_SHOOTABLE, "enemy", "cybsit"),
     7: ("SPIDA1", 128, 100, 3000, MF_SOLID | MF_SHOOTABLE, "enemy", "spisit"),
     68: ("BSPIA1", 64, 64, 500, MF_SOLID | MF_SHOOTABLE, "enemy", "bspsit"),
@@ -72,9 +86,12 @@ INFO = {
     64: ("VILEA1", 20, 56, 700, MF_SOLID | MF_SHOOTABLE, "enemy", "vilsit"),
     66: ("SKELA1", 20, 56, 500, MF_SOLID | MF_SHOOTABLE, "enemy", "skesit"),
     67: ("FATTA1", 48, 64, 600, MF_SOLID | MF_SHOOTABLE, "enemy", "mansit"),
-    71: ("PAINA1", 31, 56, 400, MF_SOLID | MF_SHOOTABLE, "enemy", "pesit"),
+    71: ("PAINA1", 31, 56, 400, MF_SOLID | MF_SHOOTABLE | MF_FLOAT | MF_NOGRAVITY, "enemy", "pesit"),
     84: ("SSWVA1", 20, 56, 50, MF_SOLID | MF_SHOOTABLE, "enemy", "posit1"),
-    72: ("KEENA1", 16, 72, 100, MF_SOLID | MF_SHOOTABLE, "enemy", "keenpn"),
+    72: ("KEENA1", 16, 72, 100, MF_SOLID | MF_SHOOTABLE | MF_NOGRAVITY, "enemy", "keenpn"),
+    87: ("", 20, 32, 1000, MF_NOBLOCKMAP | MF_NOSECTOR, "bosstarget", None),
+    88: ("BBRNA1", 16, 16, 250, MF_SOLID | MF_SHOOTABLE, "enemy", "bossit"),
+    89: ("", 20, 32, 1000, MF_NOBLOCKMAP | MF_NOSECTOR, "braineye", None),
     2035: ("BAR1A0", 10, 42, 20, MF_SOLID | MF_SHOOTABLE, "enemy", None),
     2011: ("STIMA0", 20, 16, 0, MF_SPECIAL, "health", 10),
     2012: ("MEDIA0", 20, 16, 0, MF_SPECIAL, "health", 25),
@@ -142,7 +159,6 @@ INFO = {
     55: ("GOR1A0", 16, 16, 0, 0, "deco", None),
     56: ("GOR2A0", 16, 16, 0, 0, "deco", None),
     57: ("GOR3A0", 16, 16, 0, 0, "deco", None),
-    58: ("GOR4A0", 16, 16, 0, 0, "deco", None),
     59: ("GOR5A0", 16, 16, 0, 0, "deco", None),
 }
 
@@ -183,54 +199,52 @@ def skill_bit(skill: int) -> int:
     return 2
 
 
-def spawn_map_things(world, skill: int) -> tuple[int, int]:
+def spawn_map_things(world, skill: int, game=None) -> tuple[int, int]:
+    from .info import MI_FLAGS, MT_SKULL, mobj_type_for_doomednum
+    from .thinker import ONCEILINGZ, ONFLOORZ, spawn_mobj
+
     bit = skill_bit(skill)
     totalkills = 0
     totalitems = 0
+    nomonsters = bool(game and getattr(game, "nomonsters", False))
     for mt in world.things:
-        if mt.type in (1, 2, 3, 4, 11, 14, 87, 89, 88):
+        if mt.type == 11:
+            continue
+        if mt.type in (1, 2, 3, 4):
+            if mt.type == 1 and game is not None and game.player is None:
+                from .player import spawn_player
+
+                game.player = spawn_player(world, mt)
             continue
         if not (mt.options & bit):
             continue
         if mt.options & 16:
             continue
-        info = INFO.get(mt.type)
-        if info is None:
+        typ = mobj_type_for_doomednum(mt.type)
+        if typ < 0:
             continue
-        sprite, rad, h, health, flags, kind, extra = info
-        if kind == "enemy" and mt.type != 2035:
-            flags |= MF_COUNTKILL
-            totalkills += 1
-        elif kind in ("bonus_h", "bonus_a", "soul", "mega", "berserk") or (
-            kind == "item" and extra != "Radiation shielding"
-        ):
-            flags |= MF_COUNTITEM
-            totalitems += 1
+        from .info import MOBJINFO
+
+        flags = MOBJINFO[typ][MI_FLAGS]
+        if nomonsters and ((flags & MF_COUNTKILL) or typ == MT_SKULL):
+            continue
+        z = ONCEILINGZ if flags & MF_SPAWNCEILING else ONFLOORZ
+        mo = spawn_mobj(world, mt.x * FRACUNIT, mt.y * FRACUNIT, z, typ, game)
+        if mo.tics > 0:
+            from .enemy import p_random
+
+            mo.tics = 1 + (p_random() % mo.tics)
+        mo.angle = as_u32((mt.angle // 45) * 0x20000000)
+        mo.spawnpoint = mt
         if mt.options & MTF_AMBUSH:
-            flags |= MF_AMBUSH
-        spr4, sprframe = _sprite_and_frame(sprite)
-        sub = point_in_subsector(world, mt.x * FRACUNIT, mt.y * FRACUNIT)
-        mo = Mobj(
-            x=mt.x * FRACUNIT,
-            y=mt.y * FRACUNIT,
-            z=sub.sector.floorheight,
-            angle=as_u32((mt.angle // 45) * 0x20000000),
-            radius=rad * FRACUNIT,
-            height=h * FRACUNIT,
-            floorz=sub.sector.floorheight,
-            ceilingz=sub.sector.ceilingheight,
-            flags=flags,
-            health=health or 1000,
-            type=mt.type,
-            sprite=spr4,
-            info=(kind, extra),
-            alive=True,
-            ai_state="look" if kind == "enemy" else "",
-            frame=sprframe,
-            tics=10 if kind == "enemy" else 0,
-            reactiontime=8 if kind == "enemy" else 0,
-        )
-        world.mobjs.append(mo)
+            mo.flags |= MF_AMBUSH
+        pickup = INFO.get(mt.type)
+        if pickup:
+            mo.info = (pickup[5], pickup[6])
+        if mo.flags & MF_COUNTKILL:
+            totalkills += 1
+        if mo.flags & MF_COUNTITEM:
+            totalitems += 1
     return totalkills, totalitems
 
 
@@ -245,8 +259,15 @@ def touch_special(game, special: Mobj, toucher: Mobj) -> None:
     player = toucher.player
     if player is None or not special.alive:
         return
-    kind, extra = special.info if special.info else ("deco", None)
+    pickup = INFO.get(getattr(special, "doomednum", special.type))
+    if special.info and special.info[0] not in (None, ""):
+        kind, extra = special.info
+    elif pickup:
+        kind, extra = pickup[5], pickup[6]
+    else:
+        kind, extra = ("deco", None)
     taken = True
+    sfx = "itemup"
     if kind == "health":
         if player.health >= MAXHEALTH:
             taken = False
@@ -282,9 +303,12 @@ def touch_special(game, special: Mobj, toucher: Mobj) -> None:
         player.armortype = 2
         player.set_message("MegaSphere!")
     elif kind == "berserk":
-        player.health = max(player.health, 100)
-        player.mo.health = player.health
-        player.set_message("Berserk!")
+        taken = give_power(player, PW_STRENGTH)
+        if taken:
+            if player.readyweapon != WP_FIST:
+                player.pendingweapon = WP_FIST
+            player.set_message("Berserk!")
+            sfx = "getpow"
     elif kind == "key":
         player.cards[int(extra)] = True
         player.set_message(KEY_NAMES.get(int(extra), "You picked up a key."))
@@ -314,12 +338,27 @@ def touch_special(game, special: Mobj, toucher: Mobj) -> None:
             give_ammo(player, i, 1)
         player.set_message("You picked up a backpack full of ammo!")
     elif kind == "item":
-        player.set_message(str(extra))
+        powers = {
+            "Invulnerability": (PW_INVULNERABILITY, "Invulnerability!"),
+            "Partial invisibility": (PW_INVISIBILITY, "Partial Invisibility"),
+            "Radiation shielding": (PW_IRONFEET, "Radiation Shielding Suit"),
+            "Computer area map": (PW_ALLMAP, "Computer Area Map"),
+            "Light amplification visor": (PW_INFRARED, "Light Amplification Visor"),
+        }
+        pair = powers.get(str(extra))
+        if pair is None:
+            player.set_message(str(extra))
+        else:
+            pw, msg = pair
+            taken = give_power(player, pw)
+            if taken:
+                player.set_message(msg)
+                sfx = "getpow"
     else:
         taken = False
     if taken:
         if kind not in ("weapon",):
-            game.start_sound("itemup")
+            game.start_sound(sfx)
         player.bonuscount += 6
         if special.flags & MF_COUNTITEM:
             player.itemcount += 1

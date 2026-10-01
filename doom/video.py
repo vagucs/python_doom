@@ -44,6 +44,7 @@ class Video:
         self._crt_map: Optional[np.ndarray] = None
         self._crt_gain: Optional[np.ndarray] = None
         self._crt_mask = np.zeros((3, 3), dtype=np.int32)
+        self._mouse_grab = False
 
     def init(self, fullscreen: bool = False, title: str = "DOOM") -> None:
         pygame.display.init()
@@ -71,6 +72,19 @@ class Video:
                 w = SCREENWIDTH * self.scale
                 h = SCREENHEIGHT * self.scale
                 self.screen = pygame.display.set_mode((w, h), flags)
+
+    def set_relative_mouse(self, enabled: bool) -> None:
+        if enabled == self._mouse_grab:
+            return
+        self._mouse_grab = enabled
+        pygame.event.set_grab(enabled)
+        pygame.mouse.set_visible(not enabled)
+        setter = getattr(pygame.mouse, "set_relative_mode", None)
+        if callable(setter):
+            try:
+                setter(enabled)
+            except pygame.error:
+                pass
 
     def toggle_fullscreen(self) -> None:
         self.fullscreen = not self.fullscreen

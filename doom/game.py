@@ -23,21 +23,29 @@ from .collision import angle_to, point_in_subsector
 from .compat import as_u32, fixed_mul
 from .defs import (
     ANG90,
+    ANG180,
     BT_ATTACK,
     BT_CHANGE,
     BT_USE,
     BT_WEAPONSHIFT,
     CF_GODMODE,
+    CF_NOCLIP,
     FRACUNIT,
     GS_FINALE,
     GS_INTERMISSION,
     GS_LEVEL,
     GS_TITLE,
+    MF_JUSTHIT,
     MF_NOCLIP,
+    MF_SKULLFLY,
     MF_SHOOTABLE,
     MF_SOLID,
     PST_DEAD,
     PST_LIVE,
+    PST_REBORN,
+    PW_IRONFEET,
+    PW_STRENGTH,
+    RADIATIONPAL,
     SCREENHEIGHT,
     SCREENWIDTH,
     SK_BABY,
@@ -57,8 +65,10 @@ from .defs import (
     WP_SUPERSHOTGUN,
 )
 from .am_map import Automap
-from .enemy import kill_monster, tick_enemies
-from .finale import Finale
+from .config import load as load_defaults, save as save_defaults
+from .deh import deh
+from .enemy import kill_monster, p_random, tick_enemies
+from .finale import Finale, commercial_finale_map
 from .menu import Menu
 from .mobj import spawn_map_things, touch_special
 from .player import (
@@ -66,6 +76,7 @@ from .player import (
     FORWARDMOVE,
     SIDEMOVE,
     Ticcmd,
+    give_power,
     player_think,
     spawn_player,
     WEAPON_FIRE_BODY,
@@ -77,7 +88,7 @@ from .render import Renderer
 from .saveg import read_and_restore, write_save
 from .sound import Sound
 from .specials import Specials
-from .sprites import draw_psprite, draw_sprites, weapon_psprite_xy
+from .sprites import WEAPONBOTTOM, draw_psprite, draw_sprites, weapon_psprite_xy
 from .status import StatusBar
 from .tables import fine_cos, fine_sin, init_tables
 from .v_video import draw_patch, fill
@@ -126,6 +137,8 @@ def find_iwad(explicit: str | None = None) -> str:
 
 
 class Game:
+    DEMOMARKER = 0x80
+
     def __init__(self) -> None:
         self.wad = Wad()
         self.video = Video()
@@ -146,9 +159,37 @@ class Game:
         self.running = True
         self.show_fps = False
         self.nomonsters = False
+        self.fastparm = False
+        self.respawnparm = False
+        self.respawnmonsters = False
+        self._fast_on = None
         self.fullscreen = False
         self.crt = False
         self.title_patch: bytes | None = None
+        self.credit_patch: bytes | None = None
+        self.page_patch: bytes | None = None
+        self.page_tic = 0
+        self.demo_sequence = -1
+        self.advancedemo = False
+        self.demo_playback = False
+        self.demo_recording = False
+        self.demo_buffer: bytes | bytearray | None = None
+        self.demo_p = 0
+        self.demo_name = ""
+        self.singledemo = False
+        self.timingdemo = False
+        self.timedemo_start = 0
+        self.gametic = 0
+        self.pwad_files: list[str] = []
+        self.record_name: str | None = None
+        self.playdemo_name: str | None = None
+        self.timedemo_name: str | None = None
+        self.nosound = False
+        self.nomusic = False
+        self.use_mouse = True
+        self.mousex = 0
+        self.mousey = 0
+        self.mouse_fire = False
         self.iwad_path = ""
         self.menu: Menu | None = None
         self.show_messages = True
@@ -167,7 +208,6 @@ class Game:
         self.wiping = False
         self.force_wipe = False
         self.next_mapn = 1
-        self._cheat_seq = {"iddqd": 0, "idkfa": 0, "iddt": 0}
         self.automap = Automap()
 
     def start_sound(self, name: str) -> None:
@@ -176,13 +216,18 @@ class Game:
     def touch_special(self, special, toucher) -> None:
         touch_special(self, special, toucher)
 
-    def use_special(self, line, thing, side: int) -> None:
+    def use_special(self, line, thing, side: int) -> bool:
         if self.specials:
-            self.specials.use_special(line, thing, side)
+            return bool(self.specials.use_special(line, thing, side))
+        return False
 
     def cross_special(self, line, side: int, thing) -> None:
         if self.specials:
             self.specials.cross_special(line, side, thing)
+
+    def shoot_special(self, line, thing) -> None:
+        if self.specials:
+            self.specials.shoot_special(line, thing)
 
     def damage_mobj(self, target, source, damage: int, inflictor=None) -> None:
         if not target.alive or not (target.flags & MF_SHOOTABLE):
@@ -196,13 +241,24 @@ class Game:
             and source.player.readyweapon == WP_CHAINSAW
         )
         if src is not None and not (target.flags & MF_NOCLIP) and not skip_saw:
+            from .info import MI_MASS, MOBJINFO
+
             ang = angle_to(src.x, src.y, target.x, target.y)
-            thrust = damage * (FRACUNIT // 8)
+            mass = MOBJINFO[target.type][MI_MASS] or 100
+            thrust = damage * (FRACUNIT // 8) * 100 // mass
+            if (
+                damage < 40
+                and damage > target.health
+                and target.z - src.z > 64 * FRACUNIT
+                and (p_random() & 1)
+            ):
+                ang = as_u32(ang + ANG180)
+                thrust *= 4
             target.momx += fixed_mul(thrust, fine_cos(ang))
             target.momy += fixed_mul(thrust, fine_sin(ang))
         if target.player:
             player = target.player
-            if (player.cheats & CF_GODMODE) and damage < 1000:
+            if ((player.cheats & CF_GODMODE) or player.powers[0]) and damage < 1000:
                 return
             saved = 0
             if player.armortype:
@@ -226,38 +282,51 @@ class Game:
                 self.start_sound("pldeth")
             else:
                 self.start_sound("plpain")
+                self._pain_or_wake(target, source)
             return
         target.health -= damage
         if target.health <= 0:
             kill_monster(target, self, source)
-        else:
-            self.start_sound("popain")
-            if source is not None:
-                target.target = source
-                if getattr(target, "ai_state", "") in ("", "look"):
-                    target.ai_state = "chase"
-                    target.reactiontime = 0
+            return
+        self._pain_or_wake(target, source)
+
+    def _pain_or_wake(self, target, source) -> None:
+        from .info import MI_PAINCHANCE, MI_PAINSTATE, MI_SEESTATE, MI_SPAWNSTATE, MOBJINFO
+        from .thinker import set_mobj_state
+
+        info = MOBJINFO[target.type]
+        if p_random() < info[MI_PAINCHANCE] and not (target.flags & MF_SKULLFLY):
+            target.flags |= MF_JUSTHIT
+            if info[MI_PAINSTATE]:
+                set_mobj_state(target, info[MI_PAINSTATE], self.world, self)
+        target.reactiontime = 0
+        if source is not None and source is not target and target.player is None:
+            target.target = source
+            if target.istate == info[MI_SPAWNSTATE] and info[MI_SEESTATE]:
+                set_mobj_state(target, info[MI_SEESTATE], self.world, self)
 
     def load_level(self, carry: bool = False) -> None:
         assert self.res is not None
         prev = self.player if carry else None
+        from .enemy import clear_random
+
+        clear_random()
         self.world = World()
         self.world.setup_level(self.wad, self.res, self.episode, self.mapn)
         self.specials = Specials(self.world, self.res, self.sound)
-        start = self.world.player_start()
-        if start is None:
+        self.player = None
+        self.totalkills, self.totalitems = spawn_map_things(self.world, self.skill, self)
+        if self.player is None:
             raise RuntimeError("no player 1 start")
-        self.player = spawn_player(self.world, start)
         if prev is not None:
             self._carry_player(prev)
         self.player.killcount = 0
         self.player.itemcount = 0
         self.player.secretcount = 0
-        self.totalkills = 0
-        self.totalitems = 0
         self.totalsecret = sum(1 for s in self.world.sectors if s.special == 9)
-        if not self.nomonsters:
-            self.totalkills, self.totalitems = spawn_map_things(self.world, self.skill)
+        from .thinker import apply_fast
+
+        apply_fast(self)
         self.leveltime = 0
         self.gamestate = GS_LEVEL
         self.specials.exit_requested = False
@@ -349,9 +418,14 @@ class Game:
         self.wi = Intermission(self, wbs)
         self.gamestate = GS_INTERMISSION
 
-    def world_done(self) -> None:
-        if self.specials and self.specials.secret_exit and self.player:
+    def world_done(self, from_finale: bool = False) -> None:
+        secret = bool(self.specials and self.specials.secret_exit)
+        if secret and self.player:
             self.player.didsecret = True
+        if not from_finale and self._commercial() and commercial_finale_map(self.mapn, secret):
+            self.finale = Finale(self)
+            self.gamestate = GS_FINALE
+            return
         self.mapn = self.next_mapn
         if self._commercial():
             lump = f"MAP{self.mapn:02d}"
@@ -366,10 +440,19 @@ class Game:
         self.complete_level()
 
     def start_new_game(self, skill: int, episode: int, mapn: int) -> None:
+        from .thinker import apply_fast
+
+        self.demo_playback = False
+        self.advancedemo = False
+        self.demo_buffer = None
         self.skill = skill
         self.episode = episode
         self.mapn = mapn
+        self._fast_on = None
+        apply_fast(self)
         self.load_level(carry=False)
+        if self.demo_recording:
+            self.begin_recording()
 
     def save_game(self, slot: int, description: str) -> bool:
         if self.gamestate != GS_LEVEL or self.player is None or self.world is None:
@@ -383,6 +466,9 @@ class Game:
         return ok
 
     def load_game(self, slot: int) -> bool:
+        self.demo_playback = False
+        self.advancedemo = False
+        self.demo_buffer = None
         try:
             ok = read_and_restore(self, slot)
         except (OSError, KeyError, TypeError, ValueError, RuntimeError):
@@ -400,15 +486,190 @@ class Game:
         return True
 
     def return_to_title(self) -> None:
-        self.gamestate = GS_TITLE
         self.player = None
         self.world = None
         self.wi = None
         self.finale = None
         self.automap.reset_level()
-        self.sound.play_title_music()
         if self.menu:
             self.menu.clear()
+        self.start_title()
+
+    def start_title(self) -> None:
+        self.demo_playback = False
+        self.demo_buffer = None
+        self.demo_p = 0
+        self.demo_sequence = -1
+        self.advancedemo = True
+        self.do_advance_demo()
+
+    def page_ticker(self) -> None:
+        self.page_tic -= 1
+        if self.page_tic < 0:
+            self.advancedemo = True
+
+    def do_advance_demo(self) -> None:
+        self.advancedemo = False
+        self.demo_playback = False
+        self.demo_sequence = (self.demo_sequence + 1) % 6
+        if self.demo_sequence == 0:
+            self.page_tic = TICRATE * 11 if self._commercial() else 170
+            self.gamestate = GS_TITLE
+            self.page_patch = self.title_patch
+            self.sound.play_title_music()
+        elif self.demo_sequence == 1:
+            if not self.play_demo("demo1"):
+                self.advancedemo = True
+                self.do_advance_demo()
+        elif self.demo_sequence == 2:
+            self.page_tic = 200
+            self.gamestate = GS_TITLE
+            self.page_patch = self.credit_patch or self.title_patch
+        elif self.demo_sequence == 3:
+            if not self.play_demo("demo2"):
+                self.advancedemo = True
+                self.do_advance_demo()
+        elif self.demo_sequence == 4:
+            self.page_tic = TICRATE * 11 if self._commercial() else 200
+            self.gamestate = GS_TITLE
+            self.page_patch = self.title_patch
+            if self._commercial():
+                self.sound.play_title_music()
+        else:
+            if not self.play_demo("demo3"):
+                self.advancedemo = True
+                self.do_advance_demo()
+
+    def play_demo(self, name: str) -> bool:
+        data = self._load_demo_bytes(name)
+        if data is None or len(data) < 13:
+            return False
+        self.demo_buffer = data
+        self.demo_p = 0
+        demo_version = data[self.demo_p]
+        self.demo_p += 1
+        if demo_version <= 4:
+            self.demo_p = 0
+        demo_skill = data[self.demo_p]
+        self.demo_p += 1
+        demo_episode = data[self.demo_p]
+        self.demo_p += 1
+        demo_map = data[self.demo_p]
+        self.demo_p += 1
+        self.demo_p += 5
+        self.demo_p += 4
+        if demo_skill <= 4:
+            self.skill = demo_skill
+        if demo_episode >= 1:
+            self.episode = demo_episode
+        if demo_map >= 1:
+            self.mapn = demo_map
+        self.load_level(False)
+        self.demo_playback = True
+        if self.timingdemo:
+            self.timedemo_start = pygame.time.get_ticks()
+            self.gametic = 0
+        return True
+
+    def _load_demo_bytes(self, name: str) -> bytes | None:
+        for path in (name, name + ".lmp"):
+            if os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    return fh.read()
+        if self.wad.check_num_for_name(name) < 0:
+            return None
+        return self.wad.cache_lump_name(name)
+
+    def begin_recording(self) -> None:
+        buf = bytearray()
+        buf.append(109)
+        buf.append(self.skill & 0xFF)
+        buf.append(self.episode & 0xFF)
+        buf.append(self.mapn & 0xFF)
+        buf.append(0)
+        buf.append(1 if self.respawnparm else 0)
+        buf.append(1 if self.fastparm else 0)
+        buf.append(1 if self.nomonsters else 0)
+        buf.append(0)
+        buf.extend(b"\x01\x00\x00\x00")
+        self.demo_buffer = buf
+        self.demo_p = len(buf)
+        self.demo_recording = True
+
+    def write_demo_ticcmd(self, cmd: Ticcmd) -> None:
+        if not isinstance(self.demo_buffer, bytearray):
+            return
+        self.demo_buffer.append(cmd.forwardmove & 0xFF)
+        self.demo_buffer.append(cmd.sidemove & 0xFF)
+        self.demo_buffer.append((cmd.angleturn >> 8) & 0xFF)
+        self.demo_buffer.append(cmd.buttons & 0xFF)
+        self.demo_p = len(self.demo_buffer)
+
+    def finish_recording(self) -> None:
+        if not self.demo_recording or not isinstance(self.demo_buffer, bytearray):
+            return
+        self.demo_buffer.append(Game.DEMOMARKER)
+        name = self.demo_name or "demo.lmp"
+        if not name.lower().endswith(".lmp"):
+            name = name + ".lmp"
+        try:
+            with open(name, "wb") as fh:
+                fh.write(self.demo_buffer)
+            print(f"Demo {name} recorded")
+        except OSError as exc:
+            print(f"Demo write failed: {exc}")
+        self.demo_recording = False
+
+    def check_demo_status(self) -> None:
+        if self.timingdemo:
+            now = pygame.time.get_ticks()
+            real = max(1, (now - self.timedemo_start) * TICRATE // 1000)
+            fps = (self.gametic * TICRATE) / real
+            print(f"timed {self.gametic} gametics in {real} realtics ({fps:.1f} fps)")
+            self.timingdemo = False
+            self.demo_playback = False
+            self.running = False
+            return
+        if self.demo_playback:
+            self.demo_playback = False
+            if self.singledemo:
+                self.running = False
+            else:
+                self.advancedemo = True
+            return
+        if self.demo_recording:
+            self.finish_recording()
+            self.running = False
+
+    def _demo_sbyte(self) -> int:
+        n = self.demo_buffer[self.demo_p]
+        self.demo_p += 1
+        return n - 256 if n >= 128 else n
+
+    def read_demo_ticcmd(self) -> Ticcmd:
+        cmd = Ticcmd()
+        if (
+            self.demo_buffer is None
+            or self.demo_p + 4 > len(self.demo_buffer)
+            or self.demo_buffer[self.demo_p] == Game.DEMOMARKER
+        ):
+            self.check_demo_status()
+            return cmd
+        cmd.forwardmove = self._demo_sbyte()
+        cmd.sidemove = self._demo_sbyte()
+        cmd.angleturn = self.demo_buffer[self.demo_p] << 8
+        self.demo_p += 1
+        if cmd.angleturn >= 32768:
+            cmd.angleturn -= 65536
+        cmd.buttons = self.demo_buffer[self.demo_p]
+        self.demo_p += 1
+        return cmd
+
+    def begin_play(self) -> None:
+        self.demo_playback = False
+        self.advancedemo = False
+        self.demo_buffer = None
+        self.load_level(False)
 
     def build_ticcmd(self) -> Ticcmd:
         cmd = Ticcmd()
@@ -461,9 +722,32 @@ class Game:
                 if key in self.keys:
                     cmd.buttons |= BT_CHANGE | (w << BT_WEAPONSHIFT)
                     break
+        if self.use_mouse:
+            sens = (self.mouse_sensitivity + 5) / 10.0
+            mx = int(self.mousex * sens)
+            my = int(self.mousey * sens)
+            cmd.forwardmove += my
+            if cmd.forwardmove > 127:
+                cmd.forwardmove = 127
+            if cmd.forwardmove < -127:
+                cmd.forwardmove = -127
+            if strafe:
+                cmd.sidemove += mx * 2
+                if cmd.sidemove > 127:
+                    cmd.sidemove = 127
+                if cmd.sidemove < -127:
+                    cmd.sidemove = -127
+            else:
+                cmd.angleturn -= mx * 8
+            if self.mouse_fire:
+                cmd.buttons |= BT_ATTACK
+            self.mousex = 0
+            self.mousey = 0
         return cmd
 
     def run_tic(self) -> None:
+        self.gametic += 1
+        self._sync_mouse_grab()
         if self.wiping:
             done = self.wipe.tick(1, self.video.fb)
             if done:
@@ -472,7 +756,10 @@ class Game:
         if self.menu:
             self.menu.ticker()
         self.sound.update()
+        if self.advancedemo:
+            self.do_advance_demo()
         if self.gamestate == GS_TITLE:
+            self.page_ticker()
             return
         if self.gamestate == GS_INTERMISSION:
             if self.wi:
@@ -484,15 +771,25 @@ class Game:
             if self.finale:
                 self.finale.ticker()
                 if self.finale.done:
-                    self.return_to_title()
+                    if self.finale.action == "worlddone":
+                        self.world_done(from_finale=True)
+                    else:
+                        self.return_to_title()
             return
         if self.gamestate != GS_LEVEL or self.player is None:
             return
-        if self.menu and self.menu.active:
+        if self.demo_playback:
+            self.player.cmd = self.read_demo_ticcmd()
+        elif self.menu and self.menu.active:
             self.player.cmd = Ticcmd()
         else:
             self.player.cmd = self.build_ticcmd()
+            if self.demo_recording:
+                self.write_demo_ticcmd(self.player.cmd)
         player_think(self.world, self.player, self, self.leveltime)
+        if self.player.playerstate == PST_REBORN:
+            self.load_level(False)
+            return
         tick_enemies(self.world, self)
         if self.specials:
             self.specials.tick()
@@ -529,9 +826,9 @@ class Game:
         self.video.present()
 
     def _draw_frame(self, fb: bytearray) -> None:
-        if self.gamestate == GS_TITLE and self.title_patch:
+        if self.gamestate == GS_TITLE and self.page_patch:
             fill(fb, 0)
-            draw_patch(fb, 0, 0, self.title_patch)
+            draw_patch(fb, 0, 0, self.page_patch)
             return
         if self.gamestate == GS_INTERMISSION and self.wi:
             self.wi.draw(fb)
@@ -547,11 +844,14 @@ class Game:
         else:
             mo = self.player.mo
             fill(fb, 0)
-            self.renderer.setup_frame(mo.x, mo.y, self.player.viewz, mo.angle, self.player.extralight)
+            self.renderer.setup_frame(
+                mo.x, mo.y, self.player.viewz, mo.angle, self.player.extralight, self.player.fixedcolormap
+            )
             self.renderer.render(self.world, fb)
             draw_sprites(self.renderer, self.world, fb)
             self.renderer.draw_masked()
-            self._draw_weapon(fb)
+            if self.player.playerstate != PST_DEAD or self.player.psprite_sy < WEAPONBOTTOM:
+                self._draw_weapon(fb)
         if self.status and (self.automap.active or self.renderer.screenblocks < 11):
             self.status.draw(fb, self.player, show_messages=self.show_messages)
 
@@ -560,8 +860,13 @@ class Game:
         pal = 0
         p = self.player
         if p is not None and self.gamestate == GS_LEVEL:
-            if p.damagecount:
-                pal = (p.damagecount + 7) >> 3
+            cnt = p.damagecount
+            if p.powers[PW_STRENGTH]:
+                bzc = 12 - (p.powers[PW_STRENGTH] // 64)
+                if bzc > cnt:
+                    cnt = bzc
+            if cnt:
+                pal = (cnt + 7) >> 3
                 if pal >= 8:
                     pal = 7
                 pal += 1
@@ -570,6 +875,8 @@ class Game:
                 if pal >= 4:
                     pal = 3
                 pal += 9
+            elif p.powers[PW_IRONFEET] > 4 * 32 or (p.powers[PW_IRONFEET] & 8):
+                pal = RADIATIONPAL
         if pal == self._st_palette:
             return
         self._st_palette = pal
@@ -609,9 +916,32 @@ class Game:
             return
         self.renderer.set_view_size(self.screen_size + 3, self.detail_level)
 
+    def _sync_mouse_grab(self) -> None:
+        want = (
+            self.use_mouse
+            and self.gamestate == GS_LEVEL
+            and not self.demo_playback
+            and not (self.menu and self.menu.active)
+        )
+        self.video.set_relative_mouse(want)
+
     def handle_event(self, ev: pygame.event.Event) -> None:
         if ev.type == pygame.QUIT:
+            if self.demo_recording:
+                self.finish_recording()
             self.running = False
+        elif ev.type == pygame.MOUSEMOTION:
+            if self.use_mouse:
+                self.mousex += ev.rel[0]
+                self.mousey += -ev.rel[1]
+        elif ev.type == pygame.MOUSEBUTTONDOWN:
+            if ev.button == 1:
+                self.mouse_fire = True
+                if self.finale and self.gamestate == GS_FINALE:
+                    self.finale.responder()
+        elif ev.type == pygame.MOUSEBUTTONUP:
+            if ev.button == 1:
+                self.mouse_fire = False
         elif ev.type == pygame.KEYDOWN:
             mods = pygame.key.get_mods()
             if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and (mods & pygame.KMOD_ALT):
@@ -619,6 +949,10 @@ class Game:
                 self.fullscreen = self.video.fullscreen
                 return
             uni = getattr(ev, "unicode", "") or ""
+            if self.finale and self.gamestate == GS_FINALE:
+                self.keys.add(ev.key)
+                if self.finale.responder():
+                    return
             if self.menu and self.menu.responder(ev.key, uni):
                 return
             if self.automap.responder(ev, self):
@@ -633,11 +967,10 @@ class Game:
                     self.start_sound("stnmov")
                 return
             self.keys.add(ev.key)
-            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                if self.gamestate == GS_TITLE:
-                    self.load_level()
-            elif ev.key == pygame.K_F11:
+            if ev.key == pygame.K_F11:
                 self.video.show_fps = not self.video.show_fps
+            elif self.demo_playback or self.gamestate == GS_TITLE:
+                self.begin_play()
             else:
                 self._feed_cheat(uni)
         elif ev.type == pygame.KEYUP:
@@ -645,53 +978,140 @@ class Game:
             self.automap.responder(ev, self)
 
     def _feed_cheat(self, uni: str) -> None:
-        """st_stuff cht_CheckCheat: type IDDQD / IDKFA with no Enter (letters only)."""
+        """st_stuff cht_CheckCheat: IDDQD, IDKFA, IDCLIP, IDCLEV, IDMUS, IDBEHOLD*."""
         if self.gamestate != GS_LEVEL or self.player is None:
             return
-        if self.skill == SK_NIGHTMARE:
-            return
         ch = (uni or "").lower()
-        if len(ch) != 1 or not ch.isalpha():
+        if len(ch) != 1 or not (ch.isalpha() or ch.isdigit()):
             return
-        for seq, pos in list(self._cheat_seq.items()):
-            expect = seq[pos] if pos < len(seq) else ""
-            if ch == expect:
-                pos += 1
-                if pos >= len(seq):
-                    self._cheat_seq[seq] = 0
-                    if seq == "iddqd":
-                        self._cheat_god()
-                    elif seq == "idkfa":
-                        self._cheat_idkfa()
-                    elif seq == "iddt":
-                        if self.automap.active:
-                            self.automap.cycle_iddt()
-                else:
-                    self._cheat_seq[seq] = pos
-            else:
-                self._cheat_seq[seq] = 1 if ch == seq[0] else 0
+        nightmare = self.skill == SK_NIGHTMARE
+        for cheat in deh.cheats:
+            param = cheat.feed(ch)
+            if param is None:
+                continue
+            if nightmare and cheat.action not in ("clev", "iddt"):
+                continue
+            self._do_cheat(cheat.action, param)
+
+    def _do_cheat(self, action: str, param: str) -> None:
+        if action == "god":
+            self._cheat_god()
+        elif action == "kfa":
+            self._cheat_ammo(True)
+        elif action == "fa":
+            self._cheat_ammo(False)
+        elif action in ("noclip", "noclip2"):
+            self._cheat_noclip()
+        elif action == "iddt":
+            if self.automap.active:
+                self.automap.cycle_iddt()
+        elif action == "behold":
+            self.player.set_message("invin visis rad allmap lite amp")
+        elif action.startswith("behold") and len(action) == 7:
+            self._cheat_behold("vsiral".find(action[6]))
+        elif action == "choppers":
+            p = self.player
+            p.weaponowned[WP_CHAINSAW] = True
+            p.pendingweapon = WP_CHAINSAW
+            p.powers[0] = 1
+            p.set_message("... doesn't suck - GM")
+        elif action == "mypos":
+            p = self.player
+            mo = p.mo
+            p.set_message(f"ang=0x{mo.angle & 0xFFFFFFFF:x};x,y=(0x{mo.x:x},0x{mo.y:x})")
+        elif action == "clev":
+            self._cheat_clev(param)
+        elif action == "mus":
+            self._cheat_mus(param)
 
     def _cheat_god(self) -> None:
         p = self.player
         p.cheats ^= CF_GODMODE
         if p.cheats & CF_GODMODE:
-            p.health = 100
+            p.health = deh.god_mode_health
             if p.mo:
-                p.mo.health = 100
+                p.mo.health = deh.god_mode_health
             p.set_message("Degreelessness Mode On")
         else:
             p.set_message("Degreelessness Mode Off")
 
-    def _cheat_idkfa(self) -> None:
+    def _cheat_ammo(self, keys: bool) -> None:
         p = self.player
-        p.armorpoints = 200
-        p.armortype = 2
+        if keys:
+            p.armorpoints = deh.idkfa_armor
+            p.armortype = deh.idkfa_armor_class
+        else:
+            p.armorpoints = deh.idfa_armor
+            p.armortype = deh.idfa_armor_class
         for i in range(len(p.weaponowned)):
             p.weaponowned[i] = True
+        p.maxammo = list(deh.maxammo)
         for i in range(len(p.ammo)):
             p.ammo[i] = p.maxammo[i]
-        p.cards = [True] * 6
-        p.set_message("Very Happy Ammo Added")
+        if keys:
+            p.cards = [True] * 6
+        p.set_message("Very Happy Ammo Added" if keys else "Ammo Added")
+
+    def _cheat_noclip(self) -> None:
+        p = self.player
+        p.cheats ^= CF_NOCLIP
+        if p.cheats & CF_NOCLIP:
+            p.mo.flags |= MF_NOCLIP
+        else:
+            p.mo.flags &= ~MF_NOCLIP
+        p.set_message("No Clipping Mode ON" if p.cheats & CF_NOCLIP else "No Clipping Mode OFF")
+
+    def _cheat_behold(self, pw: int) -> None:
+        if pw < 0:
+            return
+        p = self.player
+        if not p.powers[pw]:
+            give_power(p, pw)
+            if pw == PW_STRENGTH and p.readyweapon != WP_FIST:
+                p.pendingweapon = WP_FIST
+        elif pw == PW_STRENGTH:
+            p.powers[pw] = 0
+        else:
+            p.powers[pw] = 1
+        p.set_message("Power-up Toggled")
+
+    def _cheat_clev(self, param: str) -> None:
+        if len(param) < 2 or not param.isdigit():
+            return
+        a, b = int(param[0]), int(param[1])
+        if self._commercial():
+            episode, mapn = 1, a * 10 + b
+            lump = f"MAP{mapn:02d}"
+        else:
+            episode, mapn = a, b
+            lump = f"E{episode}M{mapn}"
+        if episode < 1 or mapn < 1 or self.wad.check_num_for_name(lump) < 0:
+            return
+        self.player.set_message("Changing Level...")
+        self.start_new_game(self.skill, episode, mapn)
+
+    def _cheat_mus(self, param: str) -> None:
+        if len(param) < 2 or not param.isdigit():
+            return
+        a, b = int(param[0]), int(param[1])
+        if self._commercial():
+            mapn = a * 10 + b
+            from .sound import DOOM2_MUSIC
+
+            if mapn < 1 or mapn > len(DOOM2_MUSIC):
+                self.player.set_message("IMPOSSIBLE SELECTION")
+                return
+            name = DOOM2_MUSIC[mapn - 1]
+        else:
+            if a < 1 or b < 1 or b > 9:
+                self.player.set_message("IMPOSSIBLE SELECTION")
+                return
+            name = f"e{a}m{b}"
+        if not self.sound.has_music(name):
+            self.player.set_message("IMPOSSIBLE SELECTION")
+            return
+        self.sound.change_music(name, looping=True)
+        self.player.set_message("Music Change")
 
 
 def parse_args(argv: list[str], game: Game) -> str | None:
@@ -712,6 +1132,14 @@ def parse_args(argv: list[str], game: Game) -> str | None:
             game.nomonsters = True
             i += 1
             continue
+        if a == "-fast":
+            game.fastparm = True
+            i += 1
+            continue
+        if a == "-respawn":
+            game.respawnparm = True
+            i += 1
+            continue
         if a == "-warp" and i + 2 < len(args):
             game.episode = int(args[i + 1])
             game.mapn = int(args[i + 2])
@@ -729,6 +1157,50 @@ def parse_args(argv: list[str], game: Game) -> str | None:
             game.crt = True
             i += 1
             continue
+        if a == "-deh":
+            i += 1
+            while i < len(args) and not args[i].startswith("-"):
+                deh.files.append(args[i])
+                i += 1
+            continue
+        if a == "-nodeh":
+            deh.nodeh = True
+            i += 1
+            continue
+        if a == "-dehlump":
+            deh.dehlump = True
+            i += 1
+            continue
+        if a == "-nocheats":
+            deh.apply_cheats = False
+            i += 1
+            continue
+        if a == "-file":
+            i += 1
+            while i < len(args) and not args[i].startswith("-"):
+                game.pwad_files.append(args[i])
+                i += 1
+            continue
+        if a == "-record" and i + 1 < len(args):
+            game.record_name = args[i + 1]
+            i += 2
+            continue
+        if a == "-playdemo" and i + 1 < len(args):
+            game.playdemo_name = args[i + 1]
+            i += 2
+            continue
+        if a == "-timedemo" and i + 1 < len(args):
+            game.timedemo_name = args[i + 1]
+            i += 2
+            continue
+        if a == "-nosound":
+            game.nosound = True
+            i += 1
+            continue
+        if a == "-nomusic":
+            game.nomusic = True
+            i += 1
+            continue
         if a.lower().endswith(".wad") and not a.startswith("-"):
             iwad = a
         i += 1
@@ -738,17 +1210,23 @@ def parse_args(argv: list[str], game: Game) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv
     game = Game()
+    load_defaults(game)
     iwad_arg = parse_args(argv, game)
     path = find_iwad(iwad_arg)
     game.iwad_path = path
     print(f"IWAD: {path}")
     game.wad.add_file(path)
+    for extra in game.pwad_files:
+        print(f"PWAD: {extra}")
+        game.wad.add_file(extra)
+    deh.load_after_iwad(game.wad, path)
     init_tables()
     game.res = Resources(game.wad)
     game.res.init()
     game.renderer = Renderer(game.res)
     game.apply_view_size()
-    pygame.mixer.pre_init(frequency=11025, size=-16, channels=1, buffer=512)
+    if not game.nosound:
+        pygame.mixer.pre_init(frequency=11025, size=-16, channels=1, buffer=512)
     pygame.init()
     game.video.init(fullscreen=game.fullscreen, title="DOOM (Python)")
     game.video.show_fps = game.show_fps
@@ -756,17 +1234,38 @@ def main(argv: list[str] | None = None) -> int:
     pal = game.wad.cache_lump_name("PLAYPAL")
     game.video.set_palette(pal)
     game._playpal = pal
+    if game.nosound:
+        game.sound.enabled = False
+        game.sound.music_enabled = False
+    if game.nomusic:
+        game.sound.music_enabled = False
     game.sound.init(game.wad)
     game.menu = Menu(game.wad, game.sound, game)
     if game.wad.check_num_for_name("TITLEPIC") >= 0:
         game.title_patch = game.wad.cache_lump_name("TITLEPIC")
+    if game.wad.check_num_for_name("CREDIT") >= 0:
+        game.credit_patch = game.wad.cache_lump_name("CREDIT")
+    game.page_patch = game.title_patch
     game.status = StatusBar(game.wad)
-    if "-warp" in argv:
+    if game.record_name:
+        game.demo_name = game.record_name
+        game.demo_recording = True
+        game.start_new_game(game.skill, game.episode, game.mapn)
+    elif game.timedemo_name:
+        game.timingdemo = True
+        game.singledemo = True
+        if not game.play_demo(game.timedemo_name):
+            print(f"timedemo not found: {game.timedemo_name}")
+            return 1
+    elif game.playdemo_name:
+        game.singledemo = True
+        if not game.play_demo(game.playdemo_name):
+            print(f"playdemo not found: {game.playdemo_name}")
+            return 1
+    elif "-warp" in argv:
         game.load_level()
     else:
-        game.gamestate = GS_TITLE
-        game.start_sound("swtchn")
-        game.sound.play_title_music()
+        game.start_title()
 
     tick_ms = 1000 / TICRATE
     accum = 0.0
@@ -777,10 +1276,16 @@ def main(argv: list[str] | None = None) -> int:
         now = pygame.time.get_ticks()
         accum += now - last
         last = now
-        while accum >= tick_ms:
+        if game.timingdemo:
             game.run_tic()
-            accum -= tick_ms
+        else:
+            while accum >= tick_ms:
+                game.run_tic()
+                accum -= tick_ms
         game.draw()
+    if game.demo_recording:
+        game.finish_recording()
+    save_defaults(game)
     game.sound.stop_music()
     pygame.quit()
     return 0

@@ -265,11 +265,6 @@ class Dehacked:
 
     def load_after_iwad(self, wad, iwad_path: str) -> None:
         if not self.nodeh:
-            base = os.path.splitext(os.path.basename(iwad_path))[0].lower()
-            if base.startswith("chex"):
-                sibling = os.path.join(os.path.dirname(iwad_path) or ".", "chex.deh")
-                if os.path.isfile(sibling):
-                    self.load_file(sibling)
             for i, lump in enumerate(wad.lumps):
                 if lump.name == "DEHACKED":
                     self.load_lump(wad, i)

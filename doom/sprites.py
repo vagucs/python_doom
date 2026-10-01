@@ -15,6 +15,7 @@ VisSprite projection and wall clip (r_things.prg).
 from __future__ import annotations
 
 import struct
+import sys
 from dataclasses import dataclass, field
 
 from .compat import as_i32, as_u32, fixed_div, fixed_mul
@@ -90,6 +91,14 @@ def init_sprite_defs(wad) -> dict[str, list[SpriteFrame]]:
                 if _install_sprite_lump(frames, lump, frame2, rotation2, True):
                     maxframe = max(maxframe, frame2)
         if maxframe >= 0:
+            for frame_i in range(maxframe + 1):
+                slot = frames[frame_i]
+                if slot.rotate == -1:
+                    print(
+                        f"R_InitSprites: No patches found for {sprname} frame {chr(ord('A') + frame_i)}",
+                        file=sys.stderr,
+                    )
+                    slot.rotate = 0
             result[sprname] = frames[: maxframe + 1]
     return result
 

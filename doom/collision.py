@@ -242,8 +242,6 @@ def _pit_thing(world, tm, other, game) -> bool:
         set_mobj_state(tm, _spawn_state(tm), world, game)
         return False
     if tm.flags & MF_MISSILE:
-        if tm.z > other.z + other.height or tm.z + tm.height < other.z:
-            return True
         target = tm.target
         if target is not None and _same_species(target, other):
             if other is target:
@@ -254,11 +252,10 @@ def _pit_thing(world, tm, other, game) -> bool:
                 return False
         if not (other.flags & MF_SHOOTABLE):
             return (other.flags & MF_SOLID) == 0
-        from .enemy import p_random
+        from .enemy import missile_reaches
 
-        dmg = ((p_random() % 8) + 1) * (tm.damage or 0)
-        if game is not None:
-            game.damage_mobj(other, tm.target if tm.target is not None else tm, dmg, tm)
+        if not missile_reaches(tm, other, tm._tmx, tm._tmy, tm.z):
+            return True
         return False
     if other.flags & MF_SPECIAL:
         solid = other.flags & MF_SOLID
@@ -803,15 +800,24 @@ def _aim(world, source, angle: int, attackrange: int) -> tuple[int, object | Non
     return 0, None
 
 
-def bullet_slope(world, source) -> int:
-    """P_BulletSlope: aim straight, then a step left and right."""
+def missile_aim(world, source) -> dict:
+    """P_SpawnPlayerMissile aim: straight, then a step left and right.
+
+    The angle that finds a target is the one the missile flies.
+    """
     base = source.angle
     span = 16 * 64 * FRACUNIT
-    for ang in (base, as_u32(base + (1 << 26)), as_u32(base - (1 << 26))):
+    shifted = as_u32(base + (1 << 26))
+    for ang in (base, shifted, as_u32(shifted - (2 << 26))):
         slope, target = _aim(world, source, ang, span)
         if target is not None:
-            return slope
-    return 0
+            return {"angle": ang, "slope": slope}
+    return {"angle": base, "slope": 0}
+
+
+def bullet_slope(world, source) -> int:
+    """P_BulletSlope: aim straight, then a step left and right."""
+    return missile_aim(world, source)["slope"]
 
 
 def line_attack(

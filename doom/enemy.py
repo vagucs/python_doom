@@ -694,13 +694,13 @@ def _check_missile_spawn(mo) -> None:
 
 
 def spawn_player_missile(world, source, sprite: str, speed: int, damage: int, kind: str) -> None:
-    """P_SpawnPlayerMissile: fire along the player's current angle."""
+    """P_SpawnPlayerMissile: aim straight, then a step left and right, and keep that angle."""
     from .info import MT_BFG, MT_PLASMA
-
-    typ = MT_ROCKET if kind == "rocket" else MT_PLASMA if kind == "plasma" else MT_BFG
-    ang = source.angle
     from .thinker import spawn_mobj
 
+    typ = MT_ROCKET if kind == "rocket" else MT_PLASMA if kind == "plasma" else MT_BFG
+    aim = cmap.missile_aim(world, source)
+    ang = aim["angle"]
     info = MOBJINFO[typ]
     spd = info[MI_SPEED]
     mo = spawn_mobj(world, source.x, source.y, source.z + 32 * FRACUNIT, typ, game=None)
@@ -708,7 +708,9 @@ def spawn_player_missile(world, source, sprite: str, speed: int, damage: int, ki
     mo.angle = ang
     mo.momx = fixed_mul(spd, fine_cos(ang))
     mo.momy = fixed_mul(spd, fine_sin(ang))
-    mo.momz = 0
+    mo.momz = fixed_mul(spd, aim["slope"])
+    if damage:
+        mo.damage = damage
     _check_missile_spawn(mo)
 
 
@@ -863,10 +865,48 @@ def mobj_z(mo, world, game) -> None:
             explode_missile(world, mo, game, hit=None)
 
 
+def missile_reaches(mo, other, x: int, y: int, z: int) -> bool:
+    """The blast reached this body, including a shot that died on the floor under it."""
+    if other is mo or other is mo.target or other.health <= 0:
+        return False
+    if not (other.flags & MF_SHOOTABLE):
+        return False
+    reach = other.radius + mo.radius
+    if abs(other.x - x) >= reach or abs(other.y - y) >= reach:
+        return False
+    slack = 64 * FRACUNIT
+    z1 = z + mo.momz
+    low = min(z, z1) - slack
+    high = max(z, z1) + mo.height + slack
+    if z <= mo.floorz:
+        low = min(low, mo.floorz - slack)
+        high = max(high, mo.floorz + slack)
+    return low <= other.z + other.height and high >= other.z
+
+
+def _missile_victim(world, mo):
+    spots = [(mo.x, mo.y, mo.z)]
+    if mo._tmx != mo.x or mo._tmy != mo.y:
+        spots.append((mo._tmx, mo._tmy, mo.z))
+    best = None
+    best_dist = 1 << 62
+    for other in world.mobjs:
+        for x, y, z in spots:
+            if not missile_reaches(mo, other, x, y, z):
+                continue
+            dist = max(abs(other.x - x), abs(other.y - y))
+            if dist < best_dist:
+                best_dist = dist
+                best = other
+    return best
+
+
 def explode_missile(world, mo, game, hit) -> None:
     from .thinker import set_mobj_state
 
-    if hit is not None:
+    if hit is None:
+        hit = _missile_victim(world, mo)
+    if hit is not None and game is not None:
         src = mo.target if mo.target is not None else mo
         dmg = mo.damage or _mi(mo)[MI_DAMAGE]
         game.damage_mobj(hit, src, dmg * ((p_random() % 8) + 1), inflictor=mo)

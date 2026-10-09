@@ -97,7 +97,14 @@ def spawn_mobj(world, x: int, y: int, z: int, typ: int, game=None) -> Mobj:
     from .collision import set_thing_position
 
     set_thing_position(world, mo)
-    set_mobj_state(mo, info[MI_SPAWNSTATE], world, game)
+    # Vanilla does not call P_SetMobjState here: A_Look must wait until the
+    # thinker advances, after P_SpawnMapThing has set the facing angle.
+    state = info[MI_SPAWNSTATE]
+    st = STATES[state]
+    mo.istate = state
+    mo.tics = st[2]
+    mo.sprite = SPRNAMES[st[0]]
+    mo.frame = st[1]
     return mo
 
 

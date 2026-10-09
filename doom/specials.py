@@ -490,18 +490,36 @@ class Specials:
                 ok = True
         return ok
 
+    def locked_blaze_door(self, line, thing, spec: int) -> None:
+        """EV_DoLockedDoor: every sector with this line's tag, not only the back sector."""
+        player = thing.player
+        if player is None:
+            return
+        if spec in (99, 133):
+            card, skull, name = IT_BLUECARD, IT_BLUESKULL, "blue"
+        elif spec in (134, 135):
+            card, skull, name = IT_REDCARD, IT_REDSKULL, "red"
+        else:
+            card, skull, name = IT_YELLOWCARD, IT_YELLOWSKULL, "yellow"
+        if not (player.cards[card] or player.cards[skull]):
+            player.message = f"You need a {name} key to open this door"
+            self.sound.play("oof")
+            return
+        if self.do_door(line, VLD_BLAZEOPEN):
+            self.change_switch(line, 1 if spec in (99, 134, 136) else 0)
+
     def vertical_door(self, line, thing) -> None:
         player = thing.player
         spec = line.special
-        if spec in (26, 32, 99, 133) and player and not (player.cards[IT_BLUECARD] or player.cards[IT_BLUESKULL]):
+        if spec in (26, 32) and player and not (player.cards[IT_BLUECARD] or player.cards[IT_BLUESKULL]):
             player.message = "You need a blue key to open this door"
             self.sound.play("oof")
             return
-        if spec in (27, 34, 136, 137) and player and not (player.cards[IT_YELLOWCARD] or player.cards[IT_YELLOWSKULL]):
+        if spec in (27, 34) and player and not (player.cards[IT_YELLOWCARD] or player.cards[IT_YELLOWSKULL]):
             player.message = "You need a yellow key to open this door"
             self.sound.play("oof")
             return
-        if spec in (28, 33, 134, 135) and player and not (player.cards[IT_REDCARD] or player.cards[IT_REDSKULL]):
+        if spec in (28, 33) and player and not (player.cards[IT_REDCARD] or player.cards[IT_REDSKULL]):
             player.message = "You need a red key to open this door"
             self.sound.play("oof")
             return
@@ -516,7 +534,7 @@ class Specials:
             line.special = 0
         elif spec == 117:
             dtype = VLD_BLAZERAISE
-        elif spec in (118, 99, 133, 134, 135, 136, 137):
+        elif spec == 118:
             dtype = VLD_BLAZEOPEN
             line.special = 0
         else:
@@ -911,8 +929,11 @@ class Specials:
         if side != 0:
             return False
         spec = line.special
-        if spec in (1, 26, 27, 28, 31, 32, 33, 34, 99, 117, 118, 133, 134, 135, 136, 137):
+        if spec in (1, 26, 27, 28, 31, 32, 33, 34, 117, 118):
             self.vertical_door(line, thing)
+            return True
+        if spec in (99, 133, 134, 135, 136, 137):
+            self.locked_blaze_door(line, thing, spec)
             return True
         if spec == 11:
             self.change_switch(line, 0)
@@ -936,7 +957,7 @@ class Specials:
             23: lambda: self.do_floor(line, lowest_floor, -1),
             71: lambda: self.do_floor(line, highest_floor, -1),
             101: lambda: self.do_floor(line, raise_floor_dest, 1),
-            102: lambda: self.do_floor(line, lambda s: s.floorheight - 8 * FRACUNIT, -1),
+            102: lambda: self.do_floor(line, highest_floor, -1),
             7: lambda: self.do_stairs(line, 8 * FRACUNIT, FLOORSPEED // 4),
             127: lambda: self.do_stairs(line, 16 * FRACUNIT, FLOORSPEED * 4),
             41: lambda: self.do_crusher(line, CEIL_LOWERTOFLOOR),
@@ -959,7 +980,7 @@ class Specials:
             116: lambda: self.do_door(line, VLD_BLAZECLOSE),
             120: lambda: self.do_plat_dwus(line, True),
             123: lambda: self.do_plat_dwus(line, True),
-            45: lambda: self.do_floor(line, lambda s: s.floorheight - 8 * FRACUNIT, -1),
+            45: lambda: self.do_floor(line, highest_floor, -1),
             60: lambda: self.do_floor(line, lowest_floor, -1),
             64: lambda: self.do_floor(line, raise_floor_dest, 1),
             70: lambda: self.do_floor(line, highest_floor, -1, FLOORSPEED * 4),

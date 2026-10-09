@@ -25,6 +25,7 @@ from .defs import (
     FINEMASK,
     FRACBITS,
     FRACUNIT,
+    MF_NOSECTOR,
     MF_SHADOW,
     SCREENWIDTH,
     SIL_BOTTOM,
@@ -152,7 +153,7 @@ def lookup_sprite(res, name: str, ang_to_thing: int, moangle: int, frame: int) -
 def draw_sprites(renderer, world, fb: bytearray) -> None:
     vis = []
     for mo in world.mobjs:
-        if not mo.sprite or mo.player is not None:
+        if not mo.sprite or mo.player is not None or (mo.flags & MF_NOSECTOR):
             continue
         item = _project(renderer, mo)
         if item is not None:

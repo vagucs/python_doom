@@ -524,7 +524,8 @@ WEAPON_ATK = {
     ),
     WP_PLASMA: (
         ("PLSGA0", 3, True, "PLSFA0", 4, 1),
-        ("PLSGB0", 20, False, "", 0, 0),
+        # A_ReFire: entering this frame restarts the shot while attack is held.
+        ("PLSGB0", 20, False, "", 0, 0, True),
     ),
     WP_BFG: (
         ("BFGGA0", 20, False, "", 0, 0),
@@ -693,7 +694,19 @@ def _enter_atk_step(player: Player, game, ammo_type, firing: bool, can_fire: boo
                 player.attackdown = False
                 player.refire = 0
             return
-        body, tics, do_fire, flash, flash_tics, light = seq[player.psprite_step]
+        step = seq[player.psprite_step]
+        body, tics, do_fire, flash, flash_tics, light = step[:6]
+        # Held fire skips the cooldown the moment the ReFire frame is entered.
+        if (
+            len(step) > 6
+            and step[6]
+            and firing
+            and can_fire
+            and player.pendingweapon == WP_NOCHANGE
+            and player.health > 0
+        ):
+            player.psprite_step = 0
+            continue
         player.psprite_body = body
         player.psprite_tics = tics
         if flash_tics:
@@ -742,7 +755,8 @@ def _do_shot(player: Player, game, ammo_type) -> None:
     hit = False
     if mo and weapon in (WP_MISSILE, WP_PLASMA, WP_BFG):
         if weapon == WP_PLASMA:
-            _ = p_random() & 1
+            player.psprite_flash = "PLSFB0" if (p_random() & 1) else "PLSFA0"
+            player.flash_tics = 4
         if weapon == WP_MISSILE:
             spawn_player_missile(game.world, mo, "MISL", 20 * FRACUNIT, 20, "rocket")
             game.start_sound("rlaunc")

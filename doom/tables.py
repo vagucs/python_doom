@@ -9,21 +9,16 @@ vagucs@gmail.com
 
 www.vagucs.com.br
 
-finesine / finetangent / tantoangle (tables.c generated at runtime).
+finesine / finetangent / tantoangle — exact vanilla tables.c values.
 """
 
 from __future__ import annotations
 
-import math
-
-from .compat import as_u32, fixed_div
+from .compat import as_u32
 from .defs import (
     ANGLETOFINESHIFT,
-    ANG90,
-    DBITS,
     FINEANGLES,
     FINEMASK,
-    FRACUNIT,
     SLOPERANGE,
 )
 
@@ -37,30 +32,13 @@ def init_tables() -> None:
     global finesine, finecosine, finetangent, tantoangle
     if finesine:
         return
-    built_sin = [0] * (FINEANGLES // 4 * 5)
-    for i in range(FINEANGLES // 4 * 5):
-        a = (i + 0.5) * math.pi * 2 / FINEANGLES
-        built_sin[i] = int(FRACUNIT * math.sin(a))
-    finesine[:] = built_sin
-    # cosine is sine shifted by ANG90 >> ANGLETOFINESHIFT = 2048
-    finecosine[:] = finesine[FINEANGLES // 4 :]
-    built_tan = [0] * (FINEANGLES // 2)
-    for i in range(FINEANGLES // 2):
-        a = (i - FINEANGLES // 4 + 0.5) * math.pi * 2 / FINEANGLES
-        try:
-            v = int(FRACUNIT * math.tan(a))
-        except ValueError:
-            v = 0x7FFFFFFF if a > 0 else -0x7FFFFFFF
-        if v > 0x7FFFFFFF:
-            v = 0x7FFFFFFF
-        elif v < -0x7FFFFFFF:
-            v = -0x7FFFFFFF
-        built_tan[i] = v
-    finetangent[:] = built_tan
-    built_ang = [0] * (SLOPERANGE + 1)
-    for i in range(SLOPERANGE + 1):
-        built_ang[i] = as_u32(int(math.atan(i / SLOPERANGE) / (math.pi * 2) * 0xFFFFFFFF))
-    tantoangle[:] = built_ang
+    from .tables_data import FINESINE, FINETANGENT, TANTOANGLE
+
+    finesine[:] = FINESINE
+    # cosine is sine shifted by ANG90 >> ANGLETOFINESHIFT = 2048 (no wrap).
+    finecosine[:] = finesine[FINEANGLES // 4 : FINEANGLES // 4 + FINEANGLES]
+    finetangent[:] = FINETANGENT
+    tantoangle[:] = TANTOANGLE
 
 
 def fine_sin(angle: int) -> int:
@@ -68,7 +46,9 @@ def fine_sin(angle: int) -> int:
 
 
 def fine_cos(angle: int) -> int:
-    return finesine[((as_u32(angle) >> ANGLETOFINESHIFT) + FINEANGLES // 4) & FINEMASK]
+    # Harbour/vanilla: finecosine[i] == finesine[i + FINEANGLES/4] (extended table, no FINEMASK).
+    idx = (as_u32(angle) >> ANGLETOFINESHIFT) & FINEMASK
+    return finesine[idx + FINEANGLES // 4]
 
 
 def slope_div(num: int, den: int) -> int:

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .collision import change_sector, point_in_subsector
+from .collision import change_sector, point_in_subsector, teleport_move
 from .defs import (
     BUTTONTIME,
     CEIL_CRUSHANDRAISE,
@@ -36,12 +36,15 @@ from .defs import (
     IT_REDSKULL,
     IT_YELLOWCARD,
     IT_YELLOWSKULL,
+    ML_SECRET,
     ML_TWOSIDED,
     MF_MISSILE,
     PLAT_BLAZEDWUS,
     PLAT_DOWN,
     PLAT_DWUS,
     PLAT_PERPETUAL,
+    PLAT_RAISEANDCHANGE,
+    PLAT_RAISETONEARESTANDCHANGE,
     PLAT_UP,
     PLAT_WAITING,
     PLATSPEED,
@@ -109,7 +112,16 @@ SWITCH_PAIRS = [
 ]
 
 
-def move_plane(world, sector, speed: int, dest: int, floor_or_ceiling: int, direction: int, crush: bool = False) -> int:
+def move_plane(
+    world,
+    sector,
+    speed: int,
+    dest: int,
+    floor_or_ceiling: int,
+    direction: int,
+    crush: bool = False,
+    game=None,
+) -> int:
     last = sector.floorheight if floor_or_ceiling == 0 else sector.ceilingheight
     past = False
     if direction == -1:
@@ -127,14 +139,14 @@ def move_plane(world, sector, speed: int, dest: int, floor_or_ceiling: int, dire
         sector.floorheight = next_h
     else:
         sector.ceilingheight = next_h
-    nofit = change_sector(world, sector, crush)
+    nofit = change_sector(world, sector, crush, game)
     if nofit:
         if not crush or past:
             if floor_or_ceiling == 0:
                 sector.floorheight = last
             else:
                 sector.ceilingheight = last
-            change_sector(world, sector, crush)
+            change_sector(world, sector, crush, game)
         return RESULT_PASTDEST if past else RESULT_CRUSHED
     return RESULT_PASTDEST if past else 0
 
@@ -169,6 +181,14 @@ def highest_floor(sector) -> int:
     for other in surrounding_sectors(sector):
         if other.floorheight > h:
             h = other.floorheight
+    return h
+
+
+def turbo_lower_dest(sector) -> int:
+    """Harbour turboLower: highest surrounding floor, +8*FRACUNIT if not already there."""
+    h = highest_floor(sector)
+    if h != sector.floorheight:
+        h += 8 * FRACUNIT
     return h
 
 
@@ -244,6 +264,7 @@ class Plat:
     high: int
     wait: int
     count: int = 0
+    crush: bool = False
     dead: bool = False
 
 
@@ -295,10 +316,11 @@ class Button:
 
 
 class Specials:
-    def __init__(self, world, res, sound) -> None:
+    def __init__(self, world, res, sound, game=None) -> None:
         self.world = world
         self.res = res
         self.sound = sound
+        self.game = game
         self.thinkers: list = []
         self.lights: list[LightThinker] = []
         self.scroll_lines: list = []
@@ -312,7 +334,8 @@ class Specials:
             if ia or ib:
                 self.switch_map[ia] = ib
                 self.switch_map[ib] = ia
-        self.spawn_specials()
+        # spawn_specials() runs after spawn_map_things (vanilla / Harbour / PHP order)
+        # so P_Random for monsters is not shifted by light init.
 
     def spawn_specials(self) -> None:
         """P_SpawnSpecials: sector lights / delayed doors and scrolling walls (48)."""
@@ -343,8 +366,11 @@ class Specials:
             if ln.special == 48:
                 self.scroll_lines.append(ln)
 
-    def tick(self) -> None:
+    def tick_lights_early(self) -> None:
+        """Lights are map thinkers: run before mid-game missiles so P_Random matches vanilla."""
         self._tick_lights()
+
+    def tick(self) -> None:
         for ln in self.scroll_lines:
             side = ln.sides[0] if ln.sides else None
             if side is not None:
@@ -378,18 +404,34 @@ class Specials:
                 self.buttons.remove(btn)
 
     def _tick_door(self, door: VerticalDoor) -> None:
+        """T_VerticalDoor: crush while closing reverses open (Harbour/vanilla)."""
         if door.direction == 0:
             door.topcountdown -= 1
-            if door.topcountdown <= 0:
-                if door.type in (VLD_NORMAL, VLD_BLAZERAISE, VLD_CLOSE):
+            if door.topcountdown == 0:
+                if door.type == VLD_BLAZERAISE:
                     door.direction = -1
-                    self.sound.play("dorcls" if door.type != VLD_BLAZERAISE else "bdcls")
-                elif door.type in (VLD_CLOSE30, VLD_RAISEIN5):
+                    self.sound.play("bdcls")
+                elif door.type == VLD_NORMAL:
+                    door.direction = -1
+                    self.sound.play("dorcls")
+                elif door.type == VLD_CLOSE30:
                     door.direction = 1
                     self.sound.play("doropn")
             return
+        if door.direction == 2:
+            door.topcountdown -= 1
+            if door.topcountdown == 0 and door.type == VLD_RAISEIN5:
+                door.direction = 1
+                door.type = VLD_NORMAL
+                self.sound.play("doropn")
+            return
         dest = door.topheight if door.direction == 1 else door.sector.floorheight
-        res = move_plane(self.world, door.sector, door.speed, dest, 1, door.direction)
+        res = move_plane(self.world, door.sector, door.speed, dest, 1, door.direction, game=self.game)
+        if door.direction == -1 and res == RESULT_CRUSHED:
+            if door.type not in (VLD_BLAZECLOSE, VLD_CLOSE):
+                door.direction = 1
+                self.sound.play("doropn")
+            return
         if res != RESULT_PASTDEST:
             return
         if door.direction == 1:
@@ -399,36 +441,58 @@ class Specials:
             else:
                 door.sector.specialdata = None
                 door.dead = True
-        else:
-            if door.type == VLD_CLOSE30:
-                door.direction = 0
-                door.topcountdown = TICRATE * 30
-            else:
-                door.sector.specialdata = None
-                door.dead = True
+            return
+        if door.type == VLD_CLOSE30:
+            door.direction = 0
+            door.topcountdown = TICRATE * 30
+            return
+        if door.type in (VLD_BLAZERAISE, VLD_BLAZECLOSE):
+            self.sound.play("bdcls")
+        door.sector.specialdata = None
+        door.dead = True
 
     def _tick_plat(self, plat: Plat) -> None:
+        """T_PlatRaise: on crush while rising (and not a crushing plat), reverse to down."""
         if plat.status == PLAT_WAITING:
             plat.count -= 1
-            if plat.count <= 0:
-                plat.status = PLAT_UP if plat.sector.floorheight <= plat.low else PLAT_DOWN
+            # Harbour/vanilla: if (!--count); floorheight == low → up.
+            if plat.count == 0:
+                plat.status = PLAT_UP if plat.sector.floorheight == plat.low else PLAT_DOWN
                 self.sound.play("pstart")
             return
         dest = plat.high if plat.status == PLAT_UP else plat.low
         direction = 1 if plat.status == PLAT_UP else -1
-        res = move_plane(self.world, plat.sector, plat.speed, dest, 0, direction)
+        res = move_plane(
+            self.world, plat.sector, plat.speed, dest, 0, direction, plat.crush, game=self.game
+        )
+        if plat.status == PLAT_UP and res == RESULT_CRUSHED and not plat.crush:
+            plat.count = plat.wait
+            plat.status = PLAT_DOWN
+            self.sound.play("pstart")
+            return
         if res == RESULT_PASTDEST:
-            if plat.status == PLAT_DOWN or plat.type == PLAT_PERPETUAL:
-                plat.status = PLAT_WAITING
+            if plat.status == PLAT_UP:
                 plat.count = plat.wait
+                plat.status = PLAT_WAITING
                 self.sound.play("pstop")
-            else:
-                plat.sector.specialdata = None
-                plat.dead = True
+                # Harbour: DWUS / blazeDWUS / raiseAndChange* remove on up pastdest.
+                if plat.type in (
+                    PLAT_DWUS,
+                    PLAT_BLAZEDWUS,
+                    PLAT_RAISEANDCHANGE,
+                    PLAT_RAISETONEARESTANDCHANGE,
+                ):
+                    plat.sector.specialdata = None
+                    plat.dead = True
+            elif plat.status == PLAT_DOWN:
+                plat.count = plat.wait
+                plat.status = PLAT_WAITING
                 self.sound.play("pstop")
 
     def _tick_floor(self, floor: FloorMove) -> None:
-        res = move_plane(self.world, floor.sector, floor.speed, floor.dest, 0, floor.direction, floor.crush)
+        res = move_plane(
+            self.world, floor.sector, floor.speed, floor.dest, 0, floor.direction, floor.crush, game=self.game
+        )
         if res == RESULT_PASTDEST:
             if floor.floorpic is not None:
                 floor.sector.floorpic = floor.floorpic
@@ -439,7 +503,9 @@ class Specials:
         dest = ceil.dest
         if ceil.ctype:
             dest = ceil.topheight if ceil.direction == 1 else ceil.bottomheight
-        res = move_plane(self.world, ceil.sector, ceil.speed, dest, 1, ceil.direction, ceil.crush)
+        res = move_plane(
+            self.world, ceil.sector, ceil.speed, dest, 1, ceil.direction, ceil.crush, game=self.game
+        )
         bounce = ceil.ctype in (CEIL_CRUSHANDRAISE, CEIL_FASTCRUSH, CEIL_SILENTCRUSH)
         if res == RESULT_PASTDEST:
             if bounce:
@@ -459,11 +525,8 @@ class Specials:
             ceil.speed = max(1, CEILSPEED // 8)
 
     def _spawn_door(self, sector, dtype: int, reverse: bool = False) -> bool:
+        """EV_DoDoor spawn: skip sector if already busy (no mid-cycle reverse)."""
         if sector.specialdata is not None:
-            door = sector.specialdata
-            if isinstance(door, VerticalDoor) and dtype in (VLD_NORMAL, VLD_BLAZERAISE):
-                door.direction = 1 if door.direction == -1 else -1
-                return True
             return False
         door = VerticalDoor(
             sector=sector,
@@ -509,8 +572,11 @@ class Specials:
             self.change_switch(line, 1 if spec in (99, 134, 136) else 0)
 
     def vertical_door(self, line, thing) -> None:
+        """EV_VerticalDoor: monsters may open but must not reverse a rising door."""
         player = thing.player
         spec = line.special
+        if player is None and spec in (26, 27, 28, 32, 33, 34):
+            return
         if spec in (26, 32) and player and not (player.cards[IT_BLUECARD] or player.cards[IT_BLUESKULL]):
             player.message = "You need a blue key to open this door"
             self.sound.play("oof")
@@ -527,6 +593,16 @@ class Specials:
         if side is None or side.sector is None:
             return
         sec = side.sector
+        # Busy door (vanilla): go back up if closing; only players may reverse open→close.
+        if sec.specialdata is not None and spec in (1, 26, 27, 28, 117):
+            busy = sec.specialdata
+            if isinstance(busy, VerticalDoor) and busy.direction == -1:
+                busy.direction = 1
+            elif player is not None and isinstance(busy, VerticalDoor):
+                busy.direction = -1
+            elif player is not None and isinstance(busy, Plat):
+                busy.wait = -1
+            return
         if spec in (1, 26, 27, 28):
             dtype = VLD_NORMAL
         elif spec in (31, 32, 33, 34):
@@ -543,21 +619,23 @@ class Specials:
 
     def do_plat_dwus(self, line, blaze: bool = False) -> bool:
         ok = False
-        speed = PLATSPEED * (8 if blaze else 1)
+        # Harbour EV_DoPlat: downWaitUpStay = PLATSPEED*4, blazeDWUS = PLATSPEED*8.
+        speed = PLATSPEED * (8 if blaze else 4)
         for sec in sectors_from_tag(self.world, line.tag):
             if sec.specialdata is not None:
                 continue
+            low = lowest_floor(sec)
+            if low > sec.floorheight:
+                low = sec.floorheight
             plat = Plat(
                 sector=sec,
                 type=PLAT_BLAZEDWUS if blaze else PLAT_DWUS,
                 status=PLAT_DOWN,
                 speed=speed,
-                low=lowest_floor(sec),
+                low=low,
                 high=sec.floorheight,
                 wait=PLATWAIT * TICRATE,
             )
-            if plat.low == plat.high:
-                plat.low = plat.high - 8 * FRACUNIT
             sec.specialdata = plat
             self.thinkers.append(plat)
             self.sound.play("pstart")
@@ -720,18 +798,25 @@ class Specials:
         return ok
 
     def do_plat_raise(self, line, amount: int = 0, change: bool = True) -> bool:
+        """EV_DoPlat raiseAndChange / raiseToNearestAndChange (Harbour p_plats.prg)."""
         ok = False
+        # Vanilla copies floorpic from the BACK side sector (sidenum[1]).
         pic = None
-        if change and line.sides[0] is not None and line.sides[0].sector is not None:
-            pic = line.sides[0].sector.floorpic
+        if change and len(line.sides) > 1 and line.sides[1] is not None and line.sides[1].sector is not None:
+            pic = line.sides[1].sector.floorpic
         for sec in sectors_from_tag(self.world, line.tag):
             if sec.specialdata is not None:
                 continue
             high = sec.floorheight + amount if amount else next_highest_floor(sec, sec.floorheight)
             if pic is not None:
                 sec.floorpic = pic
+            # raiseToNearestAndChange (amount==0): clear slime/etc. while rising.
+            if amount == 0:
+                sec.special = 0
             plat = Plat(
-                sector=sec, type=PLAT_DWUS, status=PLAT_UP,
+                sector=sec,
+                type=PLAT_RAISETONEARESTANDCHANGE if amount == 0 else PLAT_RAISEANDCHANGE,
+                status=PLAT_UP,
                 speed=PLATSPEED // 2, low=sec.floorheight, high=high, wait=0,
             )
             sec.specialdata = plat
@@ -848,8 +933,9 @@ class Specials:
         if sector.specialdata is not None:
             return
         sector.special = 0
+        # Harbour: type vld_normal, direction 0, countdown 30*TICRATE.
         door = VerticalDoor(
-            sector=sector, type=VLD_CLOSE, direction=0,
+            sector=sector, type=VLD_NORMAL, direction=0,
             topheight=sector.ceilingheight, speed=VDOORSPEED, topwait=VDOORWAIT,
             topcountdown=30 * TICRATE,
         )
@@ -860,8 +946,9 @@ class Specials:
         if sector.specialdata is not None:
             return
         sector.special = 0
+        # Harbour: direction 2 (initial wait), type vld_raiseIn5Mins.
         door = VerticalDoor(
-            sector=sector, type=VLD_RAISEIN5, direction=0,
+            sector=sector, type=VLD_RAISEIN5, direction=2,
             topheight=lowest_ceiling(sector) - 4 * FRACUNIT, speed=VDOORSPEED,
             topwait=VDOORWAIT, topcountdown=5 * 60 * TICRATE,
         )
@@ -928,6 +1015,12 @@ class Specials:
     def use_special(self, line, thing, side: int) -> bool:
         if side != 0:
             return False
+        # Monsters: only non-secret DR doors 1/32/33/34 (vanilla P_UseSpecialLine).
+        if thing.player is None:
+            if line.flags & ML_SECRET:
+                return False
+            if line.special not in (1, 32, 33, 34):
+                return False
         spec = line.special
         if spec in (1, 26, 27, 28, 31, 32, 33, 34, 117, 118):
             self.vertical_door(line, thing)
@@ -955,7 +1048,7 @@ class Specials:
             122: lambda: self.do_plat_dwus(line, True),
             18: lambda: self.do_floor(line, lambda s: next_highest_floor(s, s.floorheight), 1),
             23: lambda: self.do_floor(line, lowest_floor, -1),
-            71: lambda: self.do_floor(line, highest_floor, -1),
+            71: lambda: self.do_floor(line, turbo_lower_dest, -1, FLOORSPEED * 4),
             101: lambda: self.do_floor(line, raise_floor_dest, 1),
             102: lambda: self.do_floor(line, highest_floor, -1),
             7: lambda: self.do_stairs(line, 8 * FRACUNIT, FLOORSPEED // 4),
@@ -978,12 +1071,12 @@ class Specials:
             114: lambda: self.do_door(line, VLD_BLAZERAISE),
             115: lambda: self.do_door(line, VLD_BLAZEOPEN),
             116: lambda: self.do_door(line, VLD_BLAZECLOSE),
-            120: lambda: self.do_plat_dwus(line, True),
+            # 120 is WR blaze DWUS (walk only); SR blaze is 123 (Harbour p_switch.prg).
             123: lambda: self.do_plat_dwus(line, True),
             45: lambda: self.do_floor(line, highest_floor, -1),
             60: lambda: self.do_floor(line, lowest_floor, -1),
             64: lambda: self.do_floor(line, raise_floor_dest, 1),
-            70: lambda: self.do_floor(line, highest_floor, -1, FLOORSPEED * 4),
+            70: lambda: self.do_floor(line, turbo_lower_dest, -1, FLOORSPEED * 4),
             43: lambda: self.do_crusher(line, CEIL_LOWERTOFLOOR),
             65: lambda: self.do_floor(line, raise_floor_crush_dest, 1, crush=True),
             66: lambda: self.do_plat_raise(line, 24 * FRACUNIT),
@@ -1019,6 +1112,29 @@ class Specials:
                 self.change_switch(line, 0)
 
     def cross_special(self, line, side: int, thing) -> None:
+        """P_CrossSpecialLine — Harbour p_spec.prg (non-player filter + walk specials)."""
+        from .info import (
+            MT_BFG,
+            MT_BRUISERSHOT,
+            MT_HEADSHOT,
+            MT_PLASMA,
+            MT_ROCKET,
+            MT_TROOPSHOT,
+        )
+
+        # Non-players: ignore projectiles; only a few specials may trigger.
+        if thing.player is None:
+            if thing.type in (
+                MT_ROCKET,
+                MT_PLASMA,
+                MT_BFG,
+                MT_TROOPSHOT,
+                MT_HEADSHOT,
+                MT_BRUISERSHOT,
+            ):
+                return
+            if line.special not in (39, 97, 125, 126, 4, 10, 88):
+                return
         spec = line.special
         once = {
             2: lambda: self.do_door(line, VLD_OPEN),
@@ -1037,7 +1153,7 @@ class Specials:
             25: lambda: self.do_crusher(line, CEIL_CRUSHANDRAISE),
             30: lambda: self.raise_to_texture(line),
             35: lambda: self.light_turn_on(line, 35),
-            36: lambda: self.do_floor(line, highest_floor, -1, FLOORSPEED * 4),
+            36: lambda: self.do_floor(line, turbo_lower_dest, -1, FLOORSPEED * 4),
             37: lambda: self.lower_and_change(line),
             38: lambda: self.do_floor(line, lowest_floor, -1),
             39: lambda: self.teleport(line, side, thing) or True,
@@ -1085,7 +1201,7 @@ class Specials:
             95: lambda: self.do_plat_raise(line, 0),
             96: lambda: self.raise_to_texture(line),
             97: lambda: self.teleport(line, side, thing),
-            98: lambda: self.do_floor(line, highest_floor, -1, FLOORSPEED * 4),
+            98: lambda: self.do_floor(line, turbo_lower_dest, -1, FLOORSPEED * 4),
             105: lambda: self.do_door(line, VLD_BLAZERAISE),
             106: lambda: self.do_door(line, VLD_BLAZEOPEN),
             107: lambda: self.do_door(line, VLD_BLAZECLOSE),
@@ -1108,35 +1224,39 @@ class Specials:
             again[spec]()
 
     def teleport(self, line, side: int, thing) -> None:
-        """EV_Teleport: walk special 39/97 onto MT_TELEPORTMAN (thing 14)."""
+        """EV_Teleport (p_telept): P_TeleportMove + two MT_TFOG (RNG) for DEMO sync."""
         if side == 1 or (thing.flags & MF_MISSILE):
             return
+        from .info import MT_TELEPORTMAN, MT_TFOG
+        from .tables import fine_cos, fine_sin
+        from .thinker import spawn_mobj
+
         tag = line.tag
+        game = self.game
         for i, sector in enumerate(self.world.sectors):
             if sector.tag != tag:
                 continue
             for dest in self.world.mobjs:
-                from .info import MT_TELEPORTMAN
-
                 if dest.type != MT_TELEPORTMAN:
                     continue
-                dest_sector = point_in_subsector(self.world, dest.x, dest.y).sector
-                if dest_sector is not sector and dest_sector.i_sector != i:
+                dest_sector = (getattr(dest, "subsector", None) or point_in_subsector(self.world, dest.x, dest.y)).sector
+                if dest_sector.i_sector != i:
                     continue
-                from .collision import set_thing_position, unset_thing_position
-
-                thing.momx = thing.momy = thing.momz = 0
-                unset_thing_position(self.world, thing)
-                thing.x = dest.x
-                thing.y = dest.y
-                ss = point_in_subsector(self.world, thing.x, thing.y)
-                thing.floorz = ss.sector.floorheight
-                thing.ceilingz = ss.sector.ceilingheight
+                oldx, oldy, oldz = thing.x, thing.y, thing.z
+                if not teleport_move(self.world, thing, dest.x, dest.y, game):
+                    return
+                # gameversion != exe_final: snap to floor (Doom2 demos).
                 thing.z = thing.floorz
-                thing.angle = dest.angle
-                set_thing_position(self.world, thing)
                 if thing.player is not None:
                     thing.player.viewz = thing.z + thing.player.viewheight
-                    thing.reactiontime = 18
+                spawn_mobj(self.world, oldx, oldy, oldz, MT_TFOG, game)
                 self.sound.play("telept")
+                fogx = dest.x + 20 * fine_cos(dest.angle)
+                fogy = dest.y + 20 * fine_sin(dest.angle)
+                spawn_mobj(self.world, fogx, fogy, thing.z, MT_TFOG, game)
+                self.sound.play("telept")
+                if thing.player is not None:
+                    thing.reactiontime = 18
+                thing.angle = dest.angle
+                thing.momx = thing.momy = thing.momz = 0
                 return

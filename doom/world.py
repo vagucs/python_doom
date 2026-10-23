@@ -17,6 +17,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 
+from .compat import shar
 from .defs import (
     ANG45,
     BOXBOTTOM,
@@ -24,6 +25,7 @@ from .defs import (
     BOXRIGHT,
     BOXTOP,
     FRACUNIT,
+    MAPBLOCKSHIFT,
     MAPLINEDEF_SIZE,
     MAPNODE_SIZE,
     MAPSECTOR_SIZE,
@@ -32,6 +34,7 @@ from .defs import (
     MAPSUBSECTOR_SIZE,
     MAPTHING_SIZE,
     MAPVERTEX_SIZE,
+    MAXRADIUS,
     ML_TWOSIDED,
 )
 from .r_data import Resources
@@ -71,6 +74,8 @@ class Sector:
     lines: list = field(default_factory=list)
     specialdata: object | None = None
     soundorg: object | None = None
+    # P_GroupLines: mapblock indices [LEFT, RIGHT, BOTTOM, TOP] for P_ChangeSector.
+    blockbox: list = field(default_factory=lambda: [0, 0, 0, 0])
     i_sector: int = 0
     validcount: int = 0
     soundtraversed: int = 0
@@ -183,6 +188,7 @@ class World:
         self.numnodes = len(self.nodes)
         for ss in self.subsectors:
             ss.sector = self.segs[ss.firstline].frontsector
+        self._group_lines_blockboxes()
 
     def _load_vertexes(self, data: bytes) -> None:
         n = len(data) // MAPVERTEX_SIZE
@@ -304,7 +310,8 @@ class World:
             nd.y = _i16(data, o + 2) * FRACUNIT
             nd.dx = _i16(data, o + 4) * FRACUNIT
             nd.dy = _i16(data, o + 6) * FRACUNIT
-            # bbox[2][4]: top, bottom, left, right per child
+            # WAD order is BOXTOP, BOXBOTTOM, BOXLEFT, BOXRIGHT (vanilla).
+            # Remap into defs indices used elsewhere (LEFT, RIGHT, BOTTOM, TOP).
             nd.bbox = []
             p = o + 8
             for _ in range(2):
@@ -312,7 +319,12 @@ class World:
                 bot = _i16(data, p + 2) * FRACUNIT
                 left = _i16(data, p + 4) * FRACUNIT
                 right = _i16(data, p + 6) * FRACUNIT
-                nd.bbox.append([top, bot, left, right])
+                box = [0, 0, 0, 0]
+                box[BOXLEFT] = left
+                box[BOXRIGHT] = right
+                box[BOXBOTTOM] = bot
+                box[BOXTOP] = top
+                nd.bbox.append(box)
                 p += 8
             nd.children = [_u16(data, p), _u16(data, p + 2)]
             self.nodes.append(nd)
@@ -350,6 +362,42 @@ class World:
 
     def _load_reject(self, data: bytes) -> None:
         self.rejectmatrix = data or b""
+
+    def _group_lines_blockboxes(self) -> None:
+        """P_GroupLines: soundorg + sector blockbox for P_ChangeSector (Harbour/PHP)."""
+        if self.bmapwidth <= 0 or self.bmapheight <= 0:
+            return
+        for sector in self.sectors:
+            left = right = bottom = top = None
+            for li in sector.lines:
+                if li.v1 is None or li.v2 is None:
+                    continue
+                for v in (li.v1, li.v2):
+                    left = v.x if left is None or v.x < left else left
+                    right = v.x if right is None or v.x > right else right
+                    bottom = v.y if bottom is None or v.y < bottom else bottom
+                    top = v.y if top is None or v.y > top else top
+            if left is None:
+                sector.blockbox = [0, 0, 0, 0]
+                continue
+            sector.soundorg = type("SoundOrg", (), {"x": (right + left) // 2, "y": (top + bottom) // 2})()
+            block = shar(top - self.bmaporgy + MAXRADIUS, MAPBLOCKSHIFT)
+            if block >= self.bmapheight:
+                block = self.bmapheight - 1
+            boxtop = max(0, block)
+            block = shar(bottom - self.bmaporgy - MAXRADIUS, MAPBLOCKSHIFT)
+            boxbottom = max(0, block)
+            block = shar(right - self.bmaporgx + MAXRADIUS, MAPBLOCKSHIFT)
+            if block >= self.bmapwidth:
+                block = self.bmapwidth - 1
+            boxright = max(0, block)
+            block = shar(left - self.bmaporgx - MAXRADIUS, MAPBLOCKSHIFT)
+            boxleft = max(0, block)
+            sector.blockbox = [0, 0, 0, 0]
+            sector.blockbox[BOXLEFT] = boxleft
+            sector.blockbox[BOXRIGHT] = boxright
+            sector.blockbox[BOXBOTTOM] = boxbottom
+            sector.blockbox[BOXTOP] = boxtop
 
     def player_start(self) -> MapThing | None:
         for t in self.things:

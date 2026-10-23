@@ -115,8 +115,10 @@ def remove_mobj(world, mo) -> None:
     mo.alive = False
     mo.istate = S_NULL
     mo.flags = 0
-    if mo in world.mobjs:
-        world.mobjs.remove(mo)
+    for i, m in enumerate(world.mobjs):
+        if m is mo:
+            del world.mobjs[i]
+            break
 
 
 def set_mobj_state(mo, state: int, world, game) -> bool:

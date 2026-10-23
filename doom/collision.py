@@ -35,6 +35,7 @@ from .defs import (
     PT_ADDTHINGS,
     PT_EARLYOUT,
     MF_DROPOFF,
+    MF_DROPPED,
     MF_FLOAT,
     MF_MISSILE,
     MF_NOBLOCKMAP,
@@ -91,15 +92,18 @@ def point_on_line_side(x: int, y: int, line) -> int:
 
 
 def box_on_line_side(bbox: list[int], line) -> int:
+    """P_BoxOnLineSide — match vanilla/Harbour (boolean compares are 1 when true)."""
     if line.dx == 0:
-        p1 = 0 if bbox[BOXRIGHT] < line.v1.x else 1
-        p2 = 0 if bbox[BOXLEFT] < line.v1.x else 1
-        if line.dy > 0:
+        # ST_VERTICAL: p1/p2 true when box edge is west of the line; xor if dy < 0.
+        p1 = 1 if bbox[BOXRIGHT] < line.v1.x else 0
+        p2 = 1 if bbox[BOXLEFT] < line.v1.x else 0
+        if line.dy < 0:
             p1 ^= 1
             p2 ^= 1
     elif line.dy == 0:
-        p1 = 0 if bbox[BOXTOP] > line.v1.y else 1
-        p2 = 0 if bbox[BOXBOTTOM] > line.v1.y else 1
+        # ST_HORIZONTAL: p1/p2 true when box edge is north of the line; xor if dx < 0.
+        p1 = 1 if bbox[BOXTOP] > line.v1.y else 0
+        p2 = 1 if bbox[BOXBOTTOM] > line.v1.y else 0
         if line.dx < 0:
             p1 ^= 1
             p2 ^= 1
@@ -144,6 +148,108 @@ tmfloorz = 0
 last_spechit: list = []
 ceilingline = None
 
+# Vanilla/Harbour: PathTraverse intercept overflow clobbers globals after the
+# intercept array (notably bulletslope). Required for Doom2 DEMO1 sync.
+MAXINTERCEPTS_ORIGINAL = 128
+_bulletslope = 0
+_open_top = 0
+_open_bottom = 0
+_open_range = 0
+_low_floor = 0
+_overrun_world = None
+# mapthing_t playerstarts[MAXPLAYERS] stand-in (x,y,angle,type,options as i16 fields)
+_playerstarts: list[list[int]] = [[0, 0, 0, 0, 0] for _ in range(8)]
+
+_OVERRUN_TABLE = (
+    (4, None, False),
+    (4, None, False),
+    (4, None, False),
+    (4, "lowfloor", False),
+    (4, "openbottom", False),
+    (4, "opentop", False),
+    (4, "openrange", False),
+    (4, None, False),
+    (120, None, False),
+    (8, None, False),
+    (4, "bulletslope", False),
+    (4, None, False),
+    (4, None, False),
+    (4, None, False),
+    (40, "playerstarts", True),
+    (4, None, False),
+    (4, "bmapwidth", False),
+    (4, None, False),
+    (4, "bmaporgx", False),
+    (4, "bmaporgy", False),
+    (4, None, False),
+    (4, "bmapheight", False),
+)
+
+
+def get_bulletslope() -> int:
+    return _bulletslope
+
+
+def _as_i16(n: int) -> int:
+    n &= 0xFFFF
+    return n - 65536 if n >= 32768 else n
+
+
+def _overrun_set_player_start_short(index: int, value: int) -> None:
+    thing = index // 5
+    field = index % 5
+    if thing < 0 or thing >= len(_playerstarts):
+        return
+    _playerstarts[thing][field] = _as_i16(value)
+
+
+def _intercepts_memory_overrun(location: int, value: int) -> None:
+    global _bulletslope, _open_top, _open_bottom, _open_range, _low_floor
+    offset = 0
+    for length, name, int16_array in _OVERRUN_TABLE:
+        if length == 0:
+            break
+        if offset + length > location:
+            if name is None:
+                break
+            if int16_array:
+                index = (location - offset) // 2
+                _overrun_set_player_start_short(index, value & 0xFFFF)
+                _overrun_set_player_start_short(index + 1, (value >> 16) & 0xFFFF)
+            elif name == "lowfloor":
+                _low_floor = value
+            elif name == "openbottom":
+                _open_bottom = value
+            elif name == "opentop":
+                _open_top = value
+            elif name == "openrange":
+                _open_range = value
+            elif name == "bulletslope":
+                _bulletslope = value
+            elif _overrun_world is not None:
+                if name == "bmapwidth":
+                    _overrun_world.bmapwidth = value
+                elif name == "bmaporgx":
+                    _overrun_world.bmaporgx = value
+                elif name == "bmaporgy":
+                    _overrun_world.bmaporgy = value
+                elif name == "bmapheight":
+                    _overrun_world.bmapheight = value
+            break
+        offset += length
+
+
+def _intercepts_overrun(intercept: dict) -> None:
+    """Harbour InterceptsOverrun — clobber globals past MAXINTERCEPTS_ORIGINAL."""
+    num = len(_intercepts) - 1
+    if num <= MAXINTERCEPTS_ORIGINAL:
+        return
+    location = (num - MAXINTERCEPTS_ORIGINAL - 1) * 12
+    _intercepts_memory_overrun(location, intercept["frac"])
+    _intercepts_memory_overrun(location + 4, 1 if intercept["isaline"] else 0)
+    # Harbour writes 0 for the pointer slot (vanilla writes the thing/line ptr).
+    _intercepts_memory_overrun(location + 8, 0)
+
 
 def unset_thing_position(world, thing) -> None:
     """P_UnsetThingPosition: drop the thing from its blockmap cell."""
@@ -166,7 +272,8 @@ def unset_thing_position(world, thing) -> None:
 
 
 def set_thing_position(world, thing) -> None:
-    """P_SetThingPosition: link the thing at the head of its block."""
+    """P_SetThingPosition: subsector + blockmap head link (vanilla)."""
+    thing.subsector = point_in_subsector(world, thing.x, thing.y)
     links = getattr(world, "blocklinks", None) or []
     thing.bnext = None
     thing.bprev = None
@@ -232,9 +339,12 @@ def _pit_thing(world, tm, other, game) -> bool:
         return True
     if tm.flags & MF_SKULLFLY:
         from .enemy import p_random
+        from .info import MI_DAMAGE, MOBJINFO
         from .thinker import set_mobj_state
 
-        dmg = ((p_random() % 8) + 1) * (tm.damage or 0)
+        # PIT_CheckThing: (P_Random%8+1) * info->damage (Harbour/vanilla).
+        base = MOBJINFO[tm.type][MI_DAMAGE]
+        dmg = ((p_random() % 8) + 1) * base
         if game is not None:
             game.damage_mobj(other, tm, dmg, tm)
         tm.flags &= ~MF_SKULLFLY
@@ -242,6 +352,11 @@ def _pit_thing(world, tm, other, game) -> bool:
         set_mobj_state(tm, _spawn_state(tm), world, game)
         return False
     if tm.flags & MF_MISSILE:
+        # PIT_CheckThing: Z overlap, then damage here (not in P_ExplodeMissile).
+        if tm.z > other.z + other.height:
+            return True
+        if tm.z + tm.height < other.z:
+            return True
         target = tm.target
         if target is not None and _same_species(target, other):
             if other is target:
@@ -252,10 +367,12 @@ def _pit_thing(world, tm, other, game) -> bool:
                 return False
         if not (other.flags & MF_SHOOTABLE):
             return (other.flags & MF_SOLID) == 0
-        from .enemy import missile_reaches
+        if game is not None:
+            from .enemy import p_random
+            from .info import MI_DAMAGE, MOBJINFO
 
-        if not missile_reaches(tm, other, tm._tmx, tm._tmy, tm.z):
-            return True
+            base = tm.damage or MOBJINFO[tm.type][MI_DAMAGE]
+            game.damage_mobj(other, tm.target, ((p_random() % 8) + 1) * base, tm)
         return False
     if other.flags & MF_SPECIAL:
         solid = other.flags & MF_SOLID
@@ -309,6 +426,58 @@ def _pit_line(tm, chk: MoveCheck, ld) -> bool:
         chk.dropoffz = lowfloor
     if ld.special:
         chk.spechit.append(ld)
+    return True
+
+
+def _pit_stomp_thing(world, tm, other, game) -> bool:
+    """PIT_StompThing: crush shootables; monsters fail if destination is occupied (except MAP30)."""
+    if not (other.flags & MF_SHOOTABLE):
+        return True
+    blockdist = other.radius + tm.radius
+    if abs(other.x - tm._tmx) >= blockdist or abs(other.y - tm._tmy) >= blockdist:
+        return True
+    if other is tm:
+        return True
+    mapn = getattr(game, "mapn", 0) if game is not None else 0
+    if tm.player is None and mapn != 30:
+        return False
+    if game is not None:
+        game.damage_mobj(other, tm, 10000, tm)
+    return True
+
+
+def teleport_move(world, thing, x: int, y: int, game=None) -> bool:
+    """P_TeleportMove: stomp shootables, then place without line checks."""
+    thing._tmx = x
+    thing._tmy = y
+    r = thing.radius
+    bbox = {
+        BOXLEFT: x - r,
+        BOXRIGHT: x + r,
+        BOXBOTTOM: y - r,
+        BOXTOP: y + r,
+    }
+    sub = point_in_subsector(world, x, y)
+    tmfloorz = sub.sector.floorheight
+    tmceilingz = sub.sector.ceilingheight
+    world.validcount += 1
+    links = getattr(world, "blocklinks", None) or []
+    if links:
+        orgx, orgy = world.bmaporgx, world.bmaporgy
+        xl = shar(bbox[BOXLEFT] - orgx - MAXRADIUS, MAPBLOCKSHIFT)
+        xh = shar(bbox[BOXRIGHT] - orgx + MAXRADIUS, MAPBLOCKSHIFT)
+        yl = shar(bbox[BOXBOTTOM] - orgy - MAXRADIUS, MAPBLOCKSHIFT)
+        yh = shar(bbox[BOXTOP] - orgy + MAXRADIUS, MAPBLOCKSHIFT)
+        for bx in range(xl, xh + 1):
+            for by in range(yl, yh + 1):
+                if not _block_things(world, bx, by, lambda th: _pit_stomp_thing(world, thing, th, game)):
+                    return False
+    unset_thing_position(world, thing)
+    thing.floorz = tmfloorz
+    thing.ceilingz = tmceilingz
+    thing.x = x
+    thing.y = y
+    set_thing_position(world, thing)
     return True
 
 
@@ -459,7 +628,9 @@ def _add_line_intercept(ld) -> bool:
         return True
     if _earlyout and frac < FRACUNIT and ld.backsector is None:
         return False
-    _intercepts.append({"frac": frac, "isaline": True, "line": ld, "thing": None})
+    inn = {"frac": frac, "isaline": True, "line": ld, "thing": None}
+    _intercepts.append(inn)
+    _intercepts_overrun(inn)
     return True
 
 
@@ -477,7 +648,9 @@ def _add_thing_intercept(thing) -> bool:
     frac = intercept_vector(tr, _Div(x1, y1, x2 - x1, y2 - y1))
     if frac < 0:
         return True
-    _intercepts.append({"frac": frac, "isaline": False, "line": None, "thing": thing})
+    inn = {"frac": frac, "isaline": False, "line": None, "thing": thing}
+    _intercepts.append(inn)
+    _intercepts_overrun(inn)
     return True
 
 
@@ -506,8 +679,9 @@ def _abs32(n: int) -> int:
 
 def path_traverse(world, x1: int, y1: int, x2: int, y2: int, flags: int, trav) -> bool:
     """P_PathTraverse: blockmap DDA, then intercepts from nearest to farthest."""
-    global _earlyout
+    global _earlyout, _overrun_world
     _earlyout = (flags & PT_EARLYOUT) != 0
+    _overrun_world = world
     world.validcount += 1
     _intercepts.clear()
     orgx, orgy = world.bmaporgx, world.bmaporgy
@@ -790,7 +964,9 @@ def _aim(world, source, angle: int, attackrange: int) -> tuple[int, object | Non
             thingtop = state["top"]
         if thingbot < state["bottom"]:
             thingbot = state["bottom"]
-        state["slope"] = (thingtop + thingbot) // 2
+        from .compat import div_trunc
+
+        state["slope"] = div_trunc(thingtop + thingbot, 2)
         state["target"] = th
         return False
 
@@ -811,13 +987,15 @@ def missile_aim(world, source) -> dict:
     for ang in (base, shifted, as_u32(shifted - (2 << 26))):
         slope, target = _aim(world, source, ang, span)
         if target is not None:
-            return {"angle": ang, "slope": slope}
-    return {"angle": base, "slope": 0}
+            return {"angle": ang, "slope": slope, "target": target}
+    return {"angle": base, "slope": 0, "target": None}
 
 
 def bullet_slope(world, source) -> int:
-    """P_BulletSlope: aim straight, then a step left and right."""
-    return missile_aim(world, source)["slope"]
+    """P_BulletSlope: aim straight, then a step left and right. Sets global bulletslope."""
+    global _bulletslope
+    _bulletslope = missile_aim(world, source)["slope"]
+    return _bulletslope
 
 
 def line_attack(
@@ -964,10 +1142,116 @@ def _thing_hit_frac(x1: int, y1: int, x2: int, y2: int, mo) -> int | None:
     return t_num * FRACUNIT // den
 
 
+def _sight_side(x: int, y: int, lx: int, ly: int, ldx: int, ldy: int) -> int:
+    """P_DivlineSide. 2 = on the line. dy==0 uses vanilla x==ly quirk.
+
+    Harbour Shar is 64-bit (no int32 clamp on the delta before >>FRACBITS). Matching
+    that matters for BSP side tests: 32-bit wrap sends the sight walk down the wrong
+    child and can hit a closed opening that the real LOS never crosses.
+    """
+    if ldx == 0:
+        if x == lx:
+            return 2
+        if x <= lx:
+            return 1 if ldy > 0 else 0
+        return 1 if ldy < 0 else 0
+    if ldy == 0:
+        if x == ly:
+            return 2
+        if y <= ly:
+            return 1 if ldx < 0 else 0
+        return 1 if ldx > 0 else 0
+    # Harbour: dx := x - node:x; left := Shar(node:dy,16) * Shar(dx,16) — no as_i32.
+    dx = (x - lx) >> FRACBITS
+    dy = (y - ly) >> FRACBITS
+    left = (ldy >> FRACBITS) * dx
+    right = dy * (ldx >> FRACBITS)
+    if right < left:
+        return 0
+    if left == right:
+        return 2
+    return 1
+
+
+def _cross_sight_subsector(world, num: int, st: dict) -> bool:
+    """P_CrossSubsector for a sight trace."""
+    if num < 0 or num >= len(world.subsectors):
+        num = 0
+    sub = world.subsectors[num]
+    n_seg = sub.firstline
+    for _ in range(sub.numlines):
+        seg = world.segs[n_seg] if n_seg < len(world.segs) else None
+        n_seg += 1
+        line = seg.linedef if seg is not None else None
+        if seg is None or line is None or line.v1 is None or line.v2 is None:
+            continue
+        if line.validcount == world.validcount:
+            continue
+        line.validcount = world.validcount
+        s1 = _sight_side(line.v1.x, line.v1.y, st["x"], st["y"], st["dx"], st["dy"])
+        s2 = _sight_side(line.v2.x, line.v2.y, st["x"], st["y"], st["dx"], st["dy"])
+        if s1 == s2:
+            continue
+        ldx = as_i32(line.v2.x - line.v1.x)
+        ldy = as_i32(line.v2.y - line.v1.y)
+        s1 = _sight_side(st["x"], st["y"], line.v1.x, line.v1.y, ldx, ldy)
+        s2 = _sight_side(st["t2x"], st["t2y"], line.v1.x, line.v1.y, ldx, ldy)
+        if s1 == s2:
+            continue
+        if line.backsector is None or (line.flags & ML_TWOSIDED) == 0:
+            return False
+        front = seg.frontsector
+        back = seg.backsector
+        if front is None or back is None:
+            return False
+        if front.floorheight == back.floorheight and front.ceilingheight == back.ceilingheight:
+            continue
+        opentop = min(front.ceilingheight, back.ceilingheight)
+        openbottom = max(front.floorheight, back.floorheight)
+        if openbottom >= opentop:
+            return False
+        frac = intercept_vector(
+            _Div(st["x"], st["y"], st["dx"], st["dy"]),
+            _Div(line.v1.x, line.v1.y, ldx, ldy),
+        )
+        if front.floorheight != back.floorheight:
+            slope = fixed_div(openbottom - st["z"], frac)
+            if slope > st["bottom"]:
+                st["bottom"] = slope
+        if front.ceilingheight != back.ceilingheight:
+            slope = fixed_div(opentop - st["z"], frac)
+            if slope < st["top"]:
+                st["top"] = slope
+        if st["top"] <= st["bottom"]:
+            return False
+    return True
+
+
+def _cross_sight_bsp(world, bspnum: int, st: dict) -> bool:
+    """P_CrossBSPNode for a sight trace. Harbour: subsector index is bspnum & 0x7FFF."""
+    if (bspnum & NF_SUBSECTOR) or bspnum < 0:
+        if (bspnum & 0xFFFF) == 0xFFFF:
+            return _cross_sight_subsector(world, 0, st)
+        return _cross_sight_subsector(world, bspnum & 0x7FFF, st)
+    if bspnum >= len(world.nodes):
+        return True
+    node = world.nodes[bspnum]
+    side = _sight_side(st["x"], st["y"], node.x, node.y, node.dx, node.dy)
+    if side == 2:
+        side = 0
+    if not _cross_sight_bsp(world, node.children[side], st):
+        return False
+    other = _sight_side(st["t2x"], st["t2y"], node.x, node.y, node.dx, node.dy)
+    if side == other:
+        return True
+    return _cross_sight_bsp(world, node.children[side ^ 1], st)
+
+
 def check_sight(world, t1, t2) -> bool:
-    """P_CheckSight: REJECT first, then 1-sided / closed lines along the trace."""
-    s1 = point_in_subsector(world, t1.x, t1.y).sector
-    s2 = point_in_subsector(world, t2.x, t2.y).sector
+    """P_CheckSight: REJECT, then BSP with a closing vertical window."""
+    # Harbour/vanilla: cached mobj subsector (not a fresh point query).
+    s1 = (getattr(t1, "subsector", None) or point_in_subsector(world, t1.x, t1.y)).sector
+    s2 = (getattr(t2, "subsector", None) or point_in_subsector(world, t2.x, t2.y)).sector
     nsec = len(world.sectors)
     rej = getattr(world, "rejectmatrix", b"") or b""
     if nsec and rej:
@@ -976,18 +1260,23 @@ def check_sight(world, t1, t2) -> bool:
         bitnum = 1 << (pnum & 7)
         if bytenum < len(rej) and (rej[bytenum] & bitnum):
             return False
-    if s1 is s2:
-        return True
-    x1, y1, x2, y2 = t1.x, t1.y, t2.x, t2.y
-    for ln in world.lines:
-        if ln.backsector is not None:
-            opentop, openbottom, _ = line_opening(ln)
-            if opentop - openbottom > 0:
-                continue
-        frac = intercept_frac(x1, y1, x2, y2, ln)
-        if frac is not None and FRACUNIT // 64 < frac < FRACUNIT - FRACUNIT // 64:
-            return False
-    return True
+    eye = t1.z + t1.height - (t1.height >> 2)
+    st = {
+        "top": (t2.z + t2.height) - eye,
+        "bottom": t2.z - eye,
+        "z": eye,
+        "x": t1.x,
+        "y": t1.y,
+        # Harbour strace.dx/dy: no int32 wrap (HB_MAXINT).
+        "dx": t2.x - t1.x,
+        "dy": t2.y - t1.y,
+        "t2x": t2.x,
+        "t2y": t2.y,
+    }
+    world.validcount += 1
+    if world.numnodes == 0:
+        return _cross_sight_subsector(world, 0, st)
+    return _cross_sight_bsp(world, world.numnodes - 1, st)
 
 
 def thing_height_clip(world, thing) -> bool:
@@ -1005,36 +1294,68 @@ def thing_height_clip(world, thing) -> bool:
     return thing.ceilingz - thing.floorz >= thing.height
 
 
-def change_sector(world, sector, crush: bool) -> bool:
-    """P_ChangeSector: after a floor/ceiling move, carry or crush things in that sector."""
+def change_sector(world, sector, crush: bool, game=None) -> bool:
+    """P_ChangeSector: blockbox walk (vanilla/Harbour) so things ride moving floors."""
+    from .enemy import p_random
+    from .info import MT_BLOOD, S_GIBS
+    from .thinker import remove_mobj, set_mobj_state, spawn_mobj
+
     nofit = False
-    for thing in world.mobjs:
-        if point_in_subsector(world, thing.x, thing.y).sector is not sector:
-            continue
+    leveltime = int(getattr(game, "leveltime", 0) or 0) if game is not None else 0
+    seen: set[int] = set()
+    bb = getattr(sector, "blockbox", None) or [0, 0, 0, 0]
+    xl = bb[BOXLEFT]
+    xh = bb[BOXRIGHT]
+    yl = bb[BOXBOTTOM]
+    yh = bb[BOXTOP]
+
+    def _pit(thing) -> bool:
+        nonlocal nofit
+        tid = id(thing)
+        if tid in seen:
+            return True
+        seen.add(tid)
         if thing_height_clip(world, thing):
-            continue
+            return True
         if thing.health <= 0:
+            if game is not None:
+                set_mobj_state(thing, S_GIBS, world, game)
             thing.flags &= ~MF_SOLID
             thing.height = 0
-            continue
+            thing.radius = 0
+            return True
+        if thing.flags & MF_DROPPED:
+            remove_mobj(world, thing)
+            return True
         if not (thing.flags & MF_SHOOTABLE):
-            continue
+            return True
         nofit = True
-        if crush:
-            thing.health -= 10
-            if thing.player is not None:
-                thing.player.health = thing.health
-            if thing.health <= 0:
-                thing.flags &= ~MF_SOLID
-                thing.height = 0
+        if crush and game is not None and (leveltime & 3) == 0:
+            game.damage_mobj(thing, None, 10)
+            blood = spawn_mobj(
+                world,
+                thing.x,
+                thing.y,
+                thing.z + thing.height // 2,
+                MT_BLOOD,
+                game,
+            )
+            blood.momx = (p_random() - p_random()) * 4096
+            blood.momy = (p_random() - p_random()) * 4096
+        return True
+
+    for bx in range(xl, xh + 1):
+        for by in range(yl, yh + 1):
+            _block_things(world, bx, by, _pit)
     return nofit
 
 
 def approx_distance(dx: int, dy: int) -> int:
-    dx, dy = abs(dx), abs(dy)
+    """P_AproxDistance — Harbour/vanilla: dx+dy-(min>>1), not dx+dy//2."""
+    dx, dy = abs(as_i32(dx)), abs(as_i32(dy))
     if dx < dy:
-        dx, dy = dy, dx
-    return dx + dy // 2
+        return dx + dy - (dx >> 1)
+    return dx + dy - (dy >> 1)
 
 
 def angle_to(x1: int, y1: int, x2: int, y2: int) -> int:

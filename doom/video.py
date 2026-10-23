@@ -14,6 +14,8 @@ pygame video: 320x200 paletted framebuffer scaled to window (doomgeneric_allegro
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Optional
 
 import numpy as np
@@ -37,6 +39,9 @@ class Video:
         self.show_fps = False
         self._fps_font: Optional[pygame.font.Font] = None
         self._fps_value = 0
+        self._fps_avg = 0.0
+        self._fps_frames = 0
+        self._fps_t0: Optional[float] = None
         self.window_title = "DOOM"
         self.crt = False
         self._crt_w = 0
@@ -45,6 +50,16 @@ class Video:
         self._crt_gain: Optional[np.ndarray] = None
         self._crt_mask = np.zeros((3, 3), dtype=np.int32)
         self._mouse_grab = False
+        # Reused present buffers (avoid alloc/tobytes every frame).
+        self._rgb = np.empty((SCREENHEIGHT, SCREENWIDTH, 3), dtype=np.uint8)
+        self._rgb_surf: Optional[pygame.Surface] = None
+        self._scaled_surf: Optional[pygame.Surface] = None
+        self._scaled_size = (0, 0)
+        self._crt_out: Optional[np.ndarray] = None
+        self._crt_surf: Optional[pygame.Surface] = None
+        self._profile = os.environ.get("DOOM_VIDEO_PROFILE", "").strip() not in ("", "0", "false")
+        self._prof_lut = self._prof_scale = self._prof_blit = self._prof_flip = 0.0
+        self._prof_n = 0
 
     def init(self, fullscreen: bool = False, title: str = "DOOM") -> None:
         pygame.display.init()
@@ -54,6 +69,10 @@ class Video:
         self._apply_mode()
         pygame.display.set_caption(title)
         self._fps_font = pygame.font.SysFont("consolas", 16)
+        # frombuffer shares self._rgb memory — keep the ndarray alive.
+        self._rgb_surf = pygame.image.frombuffer(
+            self._rgb, (SCREENWIDTH, SCREENHEIGHT), "RGB"
+        )
 
     def _apply_mode(self) -> None:
         try:
@@ -72,6 +91,21 @@ class Video:
                 w = SCREENWIDTH * self.scale
                 h = SCREENHEIGHT * self.scale
                 self.screen = pygame.display.set_mode((w, h), flags)
+        self._scaled_surf = None
+        self._scaled_size = (0, 0)
+        self._crt_surf = None
+        self._crt_out = None
+
+    def _ensure_scaled(self, dw: int, dh: int) -> pygame.Surface:
+        if self._scaled_surf is None or self._scaled_size != (dw, dh):
+            # Same pixel format as frombuffer RGB source (required by transform.scale dest).
+            src = self._rgb_surf
+            if src is not None:
+                self._scaled_surf = pygame.Surface((dw, dh), 0, src)
+            else:
+                self._scaled_surf = pygame.Surface((dw, dh))
+            self._scaled_size = (dw, dh)
+        return self._scaled_surf
 
     def set_relative_mouse(self, enabled: bool) -> None:
         if enabled == self._mouse_grab:
@@ -118,25 +152,85 @@ class Video:
             self._lut[i] = (r, g, b)
 
     def present(self) -> None:
-        idx = np.frombuffer(self.fb, dtype=np.uint8).reshape(SCREENHEIGHT, SCREENWIDTH)
-        rgb = self._lut[idx]
         assert self.screen is not None
+        assert self._rgb_surf is not None
         dw, dh = self.screen.get_size()
+        t0 = t1 = t2 = t3 = t4 = 0.0
+        if self._profile:
+            t0 = time.perf_counter()
+
+        idx = np.frombuffer(self.fb, dtype=np.uint8).reshape(SCREENHEIGHT, SCREENWIDTH)
+        np.take(self._lut, idx, axis=0, out=self._rgb)
+
+        if self._profile:
+            t1 = time.perf_counter()
+
         if self.crt and dw > 0 and dh > 0:
-            out = self._crt_present(rgb, dw, dh)
-            surf = pygame.image.frombuffer(out.tobytes(), (dw, dh), "RGB")
-            self.screen.blit(surf, (0, 0))
+            out = self._crt_present(self._rgb, dw, dh)
+            if self._crt_surf is None or self._crt_surf.get_size() != (dw, dh):
+                self._crt_surf = pygame.image.frombuffer(out, (dw, dh), "RGB")
+            self.screen.blit(self._crt_surf, (0, 0))
+            if self._profile:
+                t2 = t3 = time.perf_counter()
         else:
-            surf = pygame.image.frombuffer(rgb.tobytes(), (SCREENWIDTH, SCREENHEIGHT), "RGB")
-            scaled = pygame.transform.scale(surf, (dw, dh))
-            self.screen.blit(scaled, (0, 0))
+            if dw == SCREENWIDTH and dh == SCREENHEIGHT:
+                self.screen.blit(self._rgb_surf, (0, 0))
+                if self._profile:
+                    t2 = t3 = time.perf_counter()
+            else:
+                scaled = self._ensure_scaled(dw, dh)
+                pygame.transform.scale(self._rgb_surf, (dw, dh), scaled)
+                if self._profile:
+                    t2 = time.perf_counter()
+                self.screen.blit(scaled, (0, 0))
+                if self._profile:
+                    t3 = time.perf_counter()
+
         if self.show_fps and self._fps_font:
-            txt = self._fps_font.render(f"{self._fps_value} FPS", True, (255, 255, 80))
+            txt = self._fps_font.render(
+                f"{self._fps_value} FPS  avg {self._fps_avg:.1f}",
+                True,
+                (255, 255, 80),
+            )
             r = txt.get_rect()
             r.topright = (self.screen.get_width() - 6, 4)
             self.screen.blit(txt, r)
+
         pygame.display.flip()
+        if self._profile:
+            t4 = time.perf_counter()
+            self._prof_lut += t1 - t0
+            self._prof_scale += t2 - t1
+            self._prof_blit += t3 - t2
+            self._prof_flip += t4 - t3
+            self._prof_n += 1
+            if self._prof_n >= 300:
+                n = self._prof_n
+                print(
+                    f"video present avg ms: lut={1000*self._prof_lut/n:.2f} "
+                    f"scale={1000*self._prof_scale/n:.2f} "
+                    f"blit={1000*self._prof_blit/n:.2f} "
+                    f"flip={1000*self._prof_flip/n:.2f} "
+                    f"(n={n})",
+                    flush=True,
+                )
+                self._prof_lut = self._prof_scale = self._prof_blit = self._prof_flip = 0.0
+                self._prof_n = 0
+
         self._fps_value = int(self._clock.get_fps())
+        if self.show_fps:
+            now = time.perf_counter()
+            if self._fps_t0 is None:
+                self._fps_t0 = now
+                self._fps_frames = 0
+            self._fps_frames += 1
+            elapsed = now - self._fps_t0
+            if elapsed > 0.0:
+                self._fps_avg = self._fps_frames / elapsed
+        else:
+            self._fps_t0 = None
+            self._fps_frames = 0
+            self._fps_avg = 0.0
         self._clock.tick()
 
     def _crt_build(self, dw: int, dh: int) -> None:
@@ -196,7 +290,13 @@ class Video:
         out = (pix.astype(np.uint32) * gain * mk[None, :, :]) >> 16
         out = np.clip(out, 0, 255).astype(np.uint8)
         out[hole] = 0
-        return np.ascontiguousarray(out)
+        out = np.ascontiguousarray(out)
+        if self._crt_out is None or self._crt_out.shape != out.shape:
+            self._crt_out = out
+            self._crt_surf = None
+        else:
+            self._crt_out[:] = out
+        return self._crt_out
 
     def ticks_ms(self) -> int:
         return pygame.time.get_ticks()

@@ -371,7 +371,7 @@ def _restore_mobj(rec: dict) -> Mobj:
         info=_parse_info(rec.get("info")),
         alive=rec.get("alive", True),
         reactiontime=rec.get("reactiontime", 0),
-        movedir=rec.get("movedir", 8),
+        movedir=rec.get("movedir", 0),
         movecount=rec.get("movecount", 0),
         ai_state=rec.get("ai_state", ""),
         frame=rec.get("frame", 0),

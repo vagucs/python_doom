@@ -181,40 +181,78 @@ def p_random() -> int:
     return RNDTABLE[_prndindex]
 
 
-def tick_enemies(world, game) -> None:
+def rng_index() -> int:
+    return _prndindex
+
+
+def tick_enemies(world, game, missiles_only=None) -> None:
+    """P_RunThinkers mobj pass.
+
+    missiles_only: None=all; False=skip MF_MISSILE; True=only MF_MISSILE.
+    Vanilla order: map mobjs, then lights (SpawnSpecials), then mid-game missiles.
+    Player.mo must run here (XY/Z), not inside player_think.
+
+    Same as PHP tickEnemies: save next by identity before think (vanilla next pointer).
+    Use `is`, never list.index/== (dataclass __eq__ is O(fields) and pegs CPU).
+    """
     from .thinker import mobj_thinker
 
     player = game.player
     if player is None or player.mo is None:
         return
-    for mo in list(world.mobjs):
-        if mo is player.mo:
+    i = 0
+    while i < len(world.mobjs):
+        mo = world.mobjs[i]
+        is_mis = bool(mo.flags & MF_MISSILE)
+        if missiles_only is False and is_mis:
+            i += 1
             continue
+        if missiles_only is True and not is_mis:
+            i += 1
+            continue
+        nxt = world.mobjs[i + 1] if i + 1 < len(world.mobjs) else None
         mobj_thinker(world, mo, game)
+        if nxt is None:
+            i += 1
+            continue
+        found = -1
+        for j, m in enumerate(world.mobjs):
+            if m is nxt:
+                found = j
+                break
+        i = found if found >= 0 else i + 1
 
 
 def kill_monster(mo, game, source) -> None:
-    from .thinker import set_mobj_state
+    from .info import MT_SKULL, MT_WOLFSS
+    from .thinker import ONFLOORZ, set_mobj_state, spawn_mobj
 
     info = _mi(mo)
     mo.flags &= ~(MF_SHOOTABLE | MF_FLOAT | MF_SKULLFLY)
+    if mo.type != MT_SKULL:
+        mo.flags &= ~MF_NOGRAVITY
     mo.flags |= MF_CORPSE | MF_DROPOFF
     mo.height >>= 2
     if source is not None and getattr(source, "player", None) is not None and (mo.flags & MF_COUNTKILL):
         source.player.killcount += 1
+    elif source is None and (mo.flags & MF_COUNTKILL) and game.player is not None:
+        game.player.killcount += 1
     xds = info[MI_XDEATHSTATE]
     st = xds if mo.health < -info[MI_SPAWNHEALTH] and xds else info[MI_DEATHSTATE]
     set_mobj_state(mo, st, game.world, game)
-    if mo.alive:
-        mo.tics -= p_random() & 3
-        if mo.tics < 1:
-            mo.tics = 1
-        drop = {MT_POSSESSED: MT_CLIP, MT_SHOTGUY: MT_SHOTGUN, MT_CHAINGUY: MT_CHAINGUN}.get(mo.type)
-        if drop is not None:
-            from .thinker import ONFLOORZ, spawn_mobj
-
-            item = spawn_mobj(game.world, mo.x, mo.y, ONFLOORZ, drop, game)
-            item.flags |= MF_DROPPED
+    # P_KillMobj always jitters death tics (vanilla), even if action cleared alive.
+    mo.tics -= p_random() & 3
+    if mo.tics < 1:
+        mo.tics = 1
+    drop = {
+        MT_WOLFSS: MT_CLIP,
+        MT_POSSESSED: MT_CLIP,
+        MT_SHOTGUY: MT_SHOTGUN,
+        MT_CHAINGUY: MT_CHAINGUN,
+    }.get(mo.type)
+    if drop is not None:
+        item = spawn_mobj(game.world, mo.x, mo.y, ONFLOORZ, drop, game)
+        item.flags |= MF_DROPPED
 
 
 def noise_alert(world, emitter, game=None) -> None:
@@ -223,7 +261,8 @@ def noise_alert(world, emitter, game=None) -> None:
 
     if emitter is None:
         return
-    sec = point_in_subsector(world, emitter.x, emitter.y).sector
+    # Harbour: emmiter->subsector->sector (cached), not a fresh point query.
+    sec = (getattr(emitter, "subsector", None) or point_in_subsector(world, emitter.x, emitter.y)).sector
     world.validcount += 1
     _recursive_sound(world, sec, 0, emitter)
 
@@ -260,7 +299,7 @@ def _look(world, mo, player_mo, game) -> None:
     mo.threshold = getattr(mo, "threshold", 0)
     mo.threshold = 0
     see = False
-    sec = point_in_subsector(world, mo.x, mo.y).sector
+    sec = (getattr(mo, "subsector", None) or point_in_subsector(world, mo.x, mo.y)).sector
     targ = sec.soundtarget
     if targ is not None and (getattr(targ, "flags", 0) & MF_SHOOTABLE):
         mo.target = targ
@@ -271,19 +310,19 @@ def _look(world, mo, player_mo, game) -> None:
     if not see:
         if not _look_for_players(world, mo, player_mo, False):
             return
-    mo.movedir = DI_NODIR
-    mo.movecount = 0
+    # Vanilla A_Look does not clear movedir/movecount (PHP/Harbour same).
     _play_see_sound(mo, game)
     set_mobj_state(mo, _mi(mo)[MI_SEESTATE], world, game)
 
 
 def _play_see_sound(mo, game) -> None:
+    # Harbour A_Look: posit1/2/3 all pick posit1+(P_Random%3); bgsit1/2 similarly.
     s = _mi(mo)[MI_SEESOUND]
     if not s:
         return
-    if s == "posit1":
+    if s in ("posit1", "posit2", "posit3"):
         s = ("posit1", "posit2", "posit3")[p_random() % 3]
-    elif s == "bgsit1":
+    elif s in ("bgsit1", "bgsit2"):
         s = ("bgsit1", "bgsit2")[p_random() % 2]
     game.start_sound(s)
 
@@ -292,9 +331,9 @@ def _play_death_sound(mo, game) -> None:
     s = _mi(mo)[MI_DEATHSOUND]
     if not s:
         return
-    if s == "podth1":
+    if s in ("podth1", "podth2", "podth3"):
         s = ("podth1", "podth2", "podth3")[p_random() % 3]
-    elif s == "bgdth1":
+    elif s in ("bgdth1", "bgdth2"):
         s = ("bgdth1", "bgdth2")[p_random() % 2]
     game.start_sound(s)
 
@@ -335,7 +374,7 @@ def _chase(world, mo, player_mo, game) -> None:
     info = _mi(mo)
     if mo.reactiontime:
         mo.reactiontime -= 1
-    if getattr(mo, "threshold", 0):
+    if mo.threshold:
         target = mo.target
         if target is None or target.health <= 0:
             mo.threshold = 0
@@ -357,7 +396,9 @@ def _chase(world, mo, player_mo, game) -> None:
     melee_st = info[MI_MELEESTATE]
     miss_st = info[MI_MISSILESTATE]
     dist = approx_distance(target.x - mo.x, target.y - mo.y)
-    melee_range = MELEERANGE - 20 * FRACUNIT + target.radius
+    # PHP: reach uses target mobjinfo radius (not mo.radius).
+    tgt_rad = int(MOBJINFO[target.type][MI_RADIUS])
+    melee_range = MELEERANGE - 20 * FRACUNIT + tgt_rad
     if melee_st and dist < melee_range and check_sight(world, mo, target):
         if info[MI_ATTACKSOUND]:
             game.start_sound(info[MI_ATTACKSOUND])
@@ -436,46 +477,53 @@ def _tick_attack(world, mo, game) -> None:
 
 
 def _do_attack(world, mo, game) -> None:
+    """Harbour A_*Attack formulas (FaceTarget rules differ per attack)."""
     kind = getattr(mo, "_attack_kind", "hitscan")
-    _face_target(mo, mo.target)
-    if kind == "melee":
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 3)
-    elif kind == "shotgun":
+    if kind == "baron":
+        # A_BruisAttack: NO FaceTarget (Harbour).
+        if _check_melee_range(world, mo):
+            game.start_sound("claw")
+            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 10)
+        else:
+            spawn_missile_mt(world, mo, mo.target, MT_BRUISERSHOT, game)
+        return
+    if kind == "shotgun":
+        # A_SPosAttack: sound, then FaceTarget, then aim (Harbour order).
         game.start_sound("shotgn")
+        _face_target(mo, mo.target)
         faced = mo.angle
         slope = aim_slope(world, mo, faced, MISSILERANGE)
         for _ in range(3):
             mo.angle = as_u32(faced + ((p_random() - p_random()) << 20))
             line_attack(world, mo, ((p_random() % 5) + 1) * 3, game, MISSILERANGE, mo.angle, slope)
         mo.angle = faced
-    elif kind in ("imp", "baron", "caco"):
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
-            game.start_sound("claw")
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 3)
-        else:
-            game.start_sound("firsht")
-            sprite = "BAL2" if kind == "baron" else "BAL1"
-            dmg = 8 if kind == "baron" else 3
-            speed = 15 * FRACUNIT if kind == "baron" else 10 * FRACUNIT
-            _spawn_missile(world, mo, mo.target, sprite, speed, dmg, "ball")
-    elif kind == "rocket":
-        game.start_sound("rlaunc")
-        _spawn_missile(world, mo, mo.target, "MISL", 20 * FRACUNIT, 20, "rocket")
-    elif kind == "plasma":
-        game.start_sound("plasma")
-        _spawn_missile(world, mo, mo.target, "APLS", 25 * FRACUNIT, 5, "plasma")
-    elif kind == "skull":
-        _skull_attack(mo, game)
-    elif kind == "chaingun":
+        return
+    if kind == "chaingun":
         game.start_sound("shotgn")
+        _face_target(mo, mo.target)
         faced = mo.angle
         slope = aim_slope(world, mo, faced, MISSILERANGE)
         mo.angle = as_u32(faced + ((p_random() - p_random()) << 20))
         line_attack(world, mo, ((p_random() % 5) + 1) * 3, game, MISSILERANGE, mo.angle, slope)
         mo.angle = faced
+        return
+    _face_target(mo, mo.target)
+    if kind == "melee":
+        if _check_melee_range(world, mo):
+            game.damage_mobj(mo.target, mo, ((p_random() % 10) + 1) * 4)
+    elif kind in ("imp", "caco"):
+        if _check_melee_range(world, mo):
+            game.start_sound("claw")
+            mod = 6 if kind == "caco" else 8
+            mul = 3 if kind == "imp" else 10
+            game.damage_mobj(mo.target, mo, ((p_random() % mod) + 1) * mul)
+        else:
+            typ = MT_HEADSHOT if kind == "caco" else MT_TROOPSHOT
+            spawn_missile_mt(world, mo, mo.target, typ, game)
+    elif kind == "rocket":
+        spawn_missile_mt(world, mo, mo.target, MT_ROCKET, game)
+    elif kind == "plasma":
+        spawn_missile_mt(world, mo, mo.target, MT_ARACHPLAZ, game)
     elif kind == "spider":
         game.start_sound("shotgn")
         faced = mo.angle
@@ -485,27 +533,27 @@ def _do_attack(world, mo, game) -> None:
             line_attack(world, mo, ((p_random() % 5) + 1) * 3, game, MISSILERANGE, mo.angle, slope)
         mo.angle = faced
     elif kind == "revenant":
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
+        if _check_melee_range(world, mo):
             game.start_sound("skeswg")
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 6)
+            game.damage_mobj(mo.target, mo, ((p_random() % 10) + 1) * 6)
         else:
             game.start_sound("skeatk")
-            miss = _spawn_missile(world, mo, mo.target, "FATB", 10 * FRACUNIT, 10, "tracer")
+            miss = spawn_missile_mt(world, mo, mo.target, MT_TRACER, game)
             miss.tracer = mo.target
     elif kind == "mancubus":
         game.start_sound("firsht")
         for da in (-FATSPREAD, 0, FATSPREAD):
-            _spawn_missile(world, mo, mo.target, "MANF", 20 * FRACUNIT, 8, "fat", ang=as_u32(mo.angle + da))
+            spawn_missile_mt(world, mo, mo.target, MT_FATSHOT, game, ang=as_u32(mo.angle + da))
     elif kind == "pain":
         game.start_sound("sklatk")
         _pain_shoot_skull(world, mo, game, mo.angle)
     elif kind == "vile":
         _vile_attack(world, mo, game)
     else:
-        game.start_sound("pistol")
+        # A_PosAttack
         faced = mo.angle
         slope = aim_slope(world, mo, faced, MISSILERANGE)
+        game.start_sound("pistol")
         mo.angle = as_u32(faced + ((p_random() - p_random()) << 20))
         line_attack(world, mo, ((p_random() % 5) + 1) * 3, game, MISSILERANGE, mo.angle, slope)
         mo.angle = faced
@@ -529,37 +577,31 @@ def _skull_attack(mo, game) -> None:
     mo.momx = fixed_mul(SKULLSPEED, fine_cos(mo.angle))
     mo.momy = fixed_mul(SKULLSPEED, fine_sin(mo.angle))
     dist = approx_distance(dest.x - mo.x, dest.y - mo.y)
+    # Harbour: Int(dist / SKULLSPEED), then Int((destZ - z) / dist).
     steps = dist // SKULLSPEED if SKULLSPEED else 1
     if steps < 1:
         steps = 1
-    mo.momz = int((dest.z + (dest.height >> 1) - mo.z) / steps)
-
-
-def _tick_skull_fly(world, mo, game) -> None:
-    if mo.momx == 0 and mo.momy == 0:
-        mo.flags &= ~MF_SKULLFLY
-        mo.momz = 0
-        from .thinker import set_mobj_state
-
-        set_mobj_state(mo, _mi(mo)[MI_SPAWNSTATE], world, game)
-        return
-    if not try_move(world, mo, mo.x + mo.momx, mo.y + mo.momy, game):
-        if mo.flags & MF_SKULLFLY:
-            mo.momx = mo.momy = 0
-        return
-    mo.z += mo.momz
-    if mo.z <= mo.floorz or mo.z + mo.height > mo.ceilingz:
-        mo.flags &= ~MF_SKULLFLY
-        mo.momx = mo.momy = mo.momz = 0
-        from .thinker import set_mobj_state
-
-        set_mobj_state(mo, _mi(mo)[MI_SPAWNSTATE], world, game)
+    mo.momz = (dest.z + (dest.height >> 1) - mo.z) // steps
 
 
 def _face_target(mo, target) -> None:
+    """A_FaceTarget: clear AMBUSH; jitter aim if target is MF_SHADOW (spectre/invis)."""
+    mo.flags &= ~MF_AMBUSH
     mo.angle = angle_to(mo.x, mo.y, target.x, target.y)
     if target.flags & MF_SHADOW:
         mo.angle = as_u32(mo.angle + (p_random() - p_random()) * 2097152)
+
+
+def _check_melee_range(world, mo) -> bool:
+    """P_CheckMeleeRange: reach uses target mobjinfo radius + sight (PHP/vanilla)."""
+    target = mo.target
+    if target is None:
+        return False
+    rad = int(MOBJINFO[target.type][MI_RADIUS])
+    dist = approx_distance(target.x - mo.x, target.y - mo.y)
+    if dist >= MELEERANGE - 20 * FRACUNIT + rad:
+        return False
+    return check_sight(world, mo, target)
 
 
 def _face_movedir(mo) -> None:
@@ -594,7 +636,8 @@ def _move(world, mo, speed: int, game) -> bool:
         mo.movedir = DI_NODIR
         good = False
         for ln in reversed(hits):
-            if ln.special and game is not None and game.use_special(ln, mo, 0):
+            # Vanilla P_Move: try every spechit (P_UseSpecialLine checks special).
+            if game is not None and game.use_special(ln, mo, 0):
                 good = True
         return good
     mo.flags &= ~MF_INFLOAT
@@ -653,8 +696,25 @@ def _new_chase_dir(world, mo, game) -> None:
         if _move(world, mo, speed, game):
             mo.movecount = p_random() & 15
             return
+    # Vanilla P_NewChaseDir: leave movecount unchanged when completely stuck.
     mo.movedir = DI_NODIR
-    mo.movecount = p_random() & 15
+
+
+def _spawn_missile(world, source, dest, sprite: str, speed: int, damage: int, kind: str = "ball", ang=None, game=None):
+    """PHP Enemy::spawnMissile — map kind → MT_* then P_SpawnMissile."""
+    from .info import MT_BFG, MT_PLASMA
+
+    typ = {
+        "rocket": MT_ROCKET,
+        "plasma": MT_ARACHPLAZ if sprite == "APLS" else MT_PLASMA,
+        "bfg": MT_BFG,
+        "tracer": MT_TRACER,
+        "fat": MT_FATSHOT,
+        "spawncube": MT_SPAWNSHOT,
+        "baron": MT_BRUISERSHOT,
+        "caco": MT_HEADSHOT,
+    }.get(kind, MT_TROOPSHOT)
+    return spawn_missile_mt(world, source, dest, typ, game, ang=ang)
 
 
 def spawn_missile_mt(world, source, dest, typ: int, game, ang=None):
@@ -679,21 +739,23 @@ def spawn_missile_mt(world, source, dest, typ: int, game, ang=None):
     mo.momx = fixed_mul(speed, fine_cos(ang))
     mo.momy = fixed_mul(speed, fine_sin(ang))
     mo.momz = int((dest.z - source.z) / steps)
-    _check_missile_spawn(mo)
+    _check_missile_spawn(mo, world, game)
     return mo
 
 
-def _check_missile_spawn(mo) -> None:
-    """P_CheckMissileSpawn: burn one P_Random, then nudge out of the shooter."""
+def _check_missile_spawn(mo, world=None, game=None) -> None:
+    """P_CheckMissileSpawn: one P_Random, nudge, explode if the spot is blocked."""
     mo.tics -= p_random() & 3
     if mo.tics < 1:
         mo.tics = 1
     mo.x += mo.momx >> 1
     mo.y += mo.momy >> 1
     mo.z += mo.momz >> 1
+    if world is not None and game is not None and not try_move(world, mo, mo.x, mo.y, game):
+        explode_missile(world, mo, game, hit=None)
 
 
-def spawn_player_missile(world, source, sprite: str, speed: int, damage: int, kind: str) -> None:
+def spawn_player_missile(world, source, sprite: str, speed: int, damage: int, kind: str, game=None) -> None:
     """P_SpawnPlayerMissile: aim straight, then a step left and right, and keep that angle."""
     from .info import MT_BFG, MT_PLASMA
     from .thinker import spawn_mobj
@@ -703,7 +765,7 @@ def spawn_player_missile(world, source, sprite: str, speed: int, damage: int, ki
     ang = aim["angle"]
     info = MOBJINFO[typ]
     spd = info[MI_SPEED]
-    mo = spawn_mobj(world, source.x, source.y, source.z + 32 * FRACUNIT, typ, game=None)
+    mo = spawn_mobj(world, source.x, source.y, source.z + 32 * FRACUNIT, typ, game)
     mo.target = source
     mo.angle = ang
     mo.momx = fixed_mul(spd, fine_cos(ang))
@@ -711,7 +773,7 @@ def spawn_player_missile(world, source, sprite: str, speed: int, damage: int, ki
     mo.momz = fixed_mul(spd, aim["slope"])
     if damage:
         mo.damage = damage
-    _check_missile_spawn(mo)
+    _check_missile_spawn(mo, world, game)
 
 
 def _trunc2(n: int) -> int:
@@ -744,11 +806,12 @@ def p_xy_movement(world, mo, game) -> None:
     xmove, ymove = mo.momx, mo.momy
     half = MAXMOVE // 2
     while xmove != 0 or ymove != 0:
+        # Vanilla: step uses C `/2` (toward zero); remainder uses `>>= 1` (arithmetic).
         if xmove > half or ymove > half:
             ptryx = mo.x + _trunc2(xmove)
             ptryy = mo.y + _trunc2(ymove)
-            xmove = _trunc2(xmove)
-            ymove = _trunc2(ymove)
+            xmove = as_i32(xmove) >> 1
+            ymove = as_i32(ymove) >> 1
         else:
             ptryx = mo.x + xmove
             ptryy = mo.y + ymove
@@ -902,36 +965,53 @@ def _missile_victim(world, mo):
 
 
 def explode_missile(world, mo, game, hit) -> None:
+    """P_ExplodeMissile: no damage here — PIT_CheckThing already hit the target."""
+    from .info import MI_DEATHSOUND
     from .thinker import set_mobj_state
 
-    if hit is None:
-        hit = _missile_victim(world, mo)
-    if hit is not None and game is not None:
-        src = mo.target if mo.target is not None else mo
-        dmg = mo.damage or _mi(mo)[MI_DAMAGE]
-        game.damage_mobj(hit, src, dmg * ((p_random() % 8) + 1), inflictor=mo)
     mo.momx = mo.momy = mo.momz = 0
-    mo.flags &= ~MF_MISSILE
     set_mobj_state(mo, _mi(mo)[MI_DEATHSTATE], world, game)
+    mo.tics -= p_random() & 3
+    if mo.tics < 1:
+        mo.tics = 1
+    mo.flags &= ~MF_MISSILE
+    sfx = str(_mi(mo)[MI_DEATHSOUND] or "")
+    if sfx and sfx != "0" and game is not None:
+        game.start_sound(sfx)
 
 
 def _radius_attack(world, spot, source, damage: int, game) -> None:
-    """P_RadiusAttack: vanilla manhattan-ish falloff; cyborg/spider immune."""
-    for other in list(world.mobjs):
-        if other is spot or not (other.flags & MF_SHOOTABLE):
-            continue
+    """P_RadiusAttack: blockmap walk (yl..yh, xl..xh) so damage/kill RNG order matches vanilla."""
+    from .collision import _block_things
+    from .defs import FRACBITS, MAPBLOCKSHIFT, MAXRADIUS
+
+    dist_map = damage * FRACUNIT + MAXRADIUS
+    yh = shar(spot.y + dist_map - world.bmaporgy, MAPBLOCKSHIFT)
+    yl = shar(spot.y - dist_map - world.bmaporgy, MAPBLOCKSHIFT)
+    xh = shar(spot.x + dist_map - world.bmaporgx, MAPBLOCKSHIFT)
+    xl = shar(spot.x - dist_map - world.bmaporgx, MAPBLOCKSHIFT)
+    src = source if source is not None else spot
+
+    def _hit(other) -> bool:
+        if not (other.flags & MF_SHOOTABLE):
+            return True
         if other.type in (MT_CYBORG, MT_SPIDER):
-            continue
+            return True
         dx = abs(other.x - spot.x)
         dy = abs(other.y - spot.y)
         dist = (dx if dx > dy else dy) - other.radius
         if dist < 0:
             dist = 0
-        dist >>= 16
+        dist >>= FRACBITS
         if dist >= damage:
-            continue
+            return True
         if check_sight(world, other, spot):
-            game.damage_mobj(other, source if source is not None else spot, damage - dist, inflictor=spot)
+            game.damage_mobj(other, src, damage - dist, inflictor=spot)
+        return True
+
+    for y in range(yl, yh + 1):
+        for x in range(xl, xh + 1):
+            _block_things(world, x, y, _hit)
 
 
 def _bfg_spray(world, ball, game) -> None:
@@ -1013,21 +1093,22 @@ def _vile_attack(world, mo, game) -> None:
 
 
 def _pain_shoot_skull(world, actor, game, ang: int) -> None:
+    """A_PainShootSkull: count>20; prestep actor+skull radius; z+8; P_TryMove."""
+    from .collision import try_move
+    from .info import MI_RADIUS, MOBJINFO
     from .thinker import spawn_mobj
 
-    n = 0
-    for other in world.mobjs:
-        if other.type == MT_SKULL and other.health > 0:
-            n += 1
-    if n >= MAX_SKULLS:
+    # Harbour: count every MT_SKULL thinker (including corpses).
+    n = sum(1 for other in world.mobjs if other.type == MT_SKULL)
+    if n > 20:
         return
-    pre = 4 * FRACUNIT + 3 * actor.radius // 2
+    skull_rad = MOBJINFO[MT_SKULL][MI_RADIUS]
+    pre = 4 * FRACUNIT + 3 * (actor.radius + skull_rad) // 2
     x = actor.x + fixed_mul(pre, fine_cos(ang))
     y = actor.y + fixed_mul(pre, fine_sin(ang))
-    skull = spawn_mobj(world, x, y, actor.z, MT_SKULL, game)
-    skull.angle = ang
-    chk = check_position(world, skull, skull.x, skull.y)
-    if chk.blocked:
+    z = actor.z + 8 * FRACUNIT
+    skull = spawn_mobj(world, x, y, z, MT_SKULL, game)
+    if not try_move(world, skull, skull.x, skull.y, game):
         game.damage_mobj(skull, actor, 10000, inflictor=actor)
         return
     skull.target = actor.target
@@ -1177,98 +1258,48 @@ def call_action(name: str, mo, world, game) -> None:
             game.start_sound(s)
     elif name == "Explode":
         _radius_attack(world, mo, mo.target, 128, game)
-    elif name == "PosAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        slope = aim_slope(world, mo, mo.angle, MISSILERANGE)
-        game.start_sound("pistol")
-        saved = mo.angle
-        mo.angle = as_u32(saved + ((p_random() - p_random()) << 20))
-        line_attack(world, mo, ((p_random() % 5) + 1) * 3, game, MISSILERANGE, mo.angle, slope)
-        mo.angle = saved
-    elif name == "SPosAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        slope = aim_slope(world, mo, mo.angle, MISSILERANGE)
-        game.start_sound("shotgn")
-        saved = mo.angle
-        for _ in range(3):
-            mo.angle = as_u32(saved + ((p_random() - p_random()) << 20))
-            line_attack(world, mo, ((p_random() % 5) + 1) * 3, game, MISSILERANGE, mo.angle, slope)
-        mo.angle = saved
-    elif name == "CPosAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        slope = aim_slope(world, mo, mo.angle, MISSILERANGE)
-        game.start_sound("shotgn")
-        saved = mo.angle
-        mo.angle = as_u32(saved + ((p_random() - p_random()) << 20))
-        line_attack(world, mo, ((p_random() % 5) + 1) * 3, game, MISSILERANGE, mo.angle, slope)
-        mo.angle = saved
-    elif name == "CPosRefire":
-        if mo.target is not None:
-            _face_target(mo, mo.target)
-        if p_random() < 40:
-            return
-        if mo.target is None or mo.target.health <= 0 or not check_sight(world, mo, mo.target):
-            set_mobj_state(mo, _mi(mo)[MI_SEESTATE], world, game)
-    elif name == "SpidRefire":
-        if mo.target is not None:
-            _face_target(mo, mo.target)
-        if p_random() < 10:
-            return
-        if mo.target is None or mo.target.health <= 0 or not check_sight(world, mo, mo.target):
-            set_mobj_state(mo, _mi(mo)[MI_SEESTATE], world, game)
-    elif name == "TroopAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
-            game.start_sound("claw")
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 3)
-        else:
-            spawn_missile_mt(world, mo, mo.target, MT_TROOPSHOT, game)
-    elif name == "SargAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 4)
-    elif name == "HeadAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 10)
-        else:
-            spawn_missile_mt(world, mo, mo.target, MT_HEADSHOT, game)
-    elif name == "BruisAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 10)
-        else:
-            spawn_missile_mt(world, mo, mo.target, MT_BRUISERSHOT, game)
     elif name == "SkullAttack":
+        # Direct A_SkullAttack (not via doAttack's extra FaceTarget).
         _skull_attack(mo, game)
-    elif name == "CyberAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        spawn_missile_mt(world, mo, mo.target, MT_ROCKET, game)
-    elif name == "BspiAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        spawn_missile_mt(world, mo, mo.target, MT_ARACHPLAZ, game)
+    elif name in (
+        "PosAttack",
+        "SPosAttack",
+        "CPosAttack",
+        "TroopAttack",
+        "SargAttack",
+        "HeadAttack",
+        "BruisAttack",
+        "CyberAttack",
+        "BspiAttack",
+        "PainAttack",
+        "CPosRefire",
+        "SpidRefire",
+    ):
+        attack_map = {
+            "PosAttack": "hitscan",
+            "SPosAttack": "shotgun",
+            "CPosAttack": "chaingun",
+            "TroopAttack": "imp",
+            "SargAttack": "melee",
+            "HeadAttack": "caco",
+            "BruisAttack": "baron",
+            "CyberAttack": "rocket",
+            "BspiAttack": "plasma",
+            "PainAttack": "pain",
+        }
+        if name in attack_map:
+            if mo.target is None:
+                return
+            mo._attack_kind = attack_map[name]
+            _do_attack(world, mo, game)
+        elif name in ("CPosRefire", "SpidRefire"):
+            if mo.target is not None:
+                _face_target(mo, mo.target)
+            keep = 40 if name == "CPosRefire" else 10
+            if p_random() < keep:
+                return
+            if mo.target is None or mo.target.health <= 0 or not check_sight(world, mo, mo.target):
+                set_mobj_state(mo, _mi(mo)[MI_SEESTATE], world, game)
     elif name == "Metal":
         game.start_sound("metal")
         _chase(world, mo, pl, game)
@@ -1278,11 +1309,6 @@ def call_action(name: str, mo, world, game) -> None:
     elif name == "Hoof":
         game.start_sound("hoof")
         _chase(world, mo, pl, game)
-    elif name == "PainAttack":
-        if mo.target is None:
-            return
-        _face_target(mo, mo.target)
-        _pain_shoot_skull(world, mo, game, mo.angle)
     elif name == "PainDie":
         mo.flags &= ~MF_SOLID
         _pain_die(world, mo, game)
@@ -1335,10 +1361,9 @@ def call_action(name: str, mo, world, game) -> None:
         if mo.target is None:
             return
         _face_target(mo, mo.target)
-        dist = approx_distance(mo.target.x - mo.x, mo.target.y - mo.y)
-        if dist < MELEERANGE + mo.radius:
+        if _check_melee_range(world, mo):
             game.start_sound("skepch")
-            game.damage_mobj(mo.target, mo, ((p_random() % 8) + 1) * 6)
+            game.damage_mobj(mo.target, mo, ((p_random() % 10) + 1) * 6)
     elif name == "SkelMissile":
         if mo.target is None:
             return

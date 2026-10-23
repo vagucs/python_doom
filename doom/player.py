@@ -16,7 +16,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .collision import angle_to, bullet_slope, line_attack, point_in_subsector, slide_move, use_lines
+from .collision import (
+    angle_to,
+    bullet_slope,
+    get_bulletslope,
+    line_attack,
+    point_in_subsector,
+    slide_move,
+    use_lines,
+)
 from .compat import as_u32, fixed_mul
 from .defs import (
     AM_CELL,
@@ -27,9 +35,11 @@ from .defs import (
     ANG180,
     BT_ATTACK,
     BT_CHANGE,
+    BT_SPECIAL,
     BT_USE,
     BT_WEAPONMASK,
     BT_WEAPONSHIFT,
+    FINEANGLES,
     FINEMASK,
     FRACUNIT,
     FRICTION,
@@ -44,6 +54,7 @@ from .defs import (
     MELEERANGE,
     MISSILERANGE,
     MF_DROPOFF,
+    MF_JUSTATTACKED,
     MF_NOCLIP,
     MF_PICKUP,
     MF_SHADOW,
@@ -93,7 +104,7 @@ class Ticcmd:
     buttons: int = 0
 
 
-@dataclass
+@dataclass(eq=False)
 class Mobj:
     x: int = 0
     y: int = 0
@@ -116,8 +127,9 @@ class Mobj:
     reactiontime: int = 0
     lastlook: int = 0
     target: object | None = None
-    movedir: int = 8
+    movedir: int = 0  # DI_EAST; vanilla/Harbour/PHP default (not DI_NODIR)
     movecount: int = 0
+    threshold: int = 0  # BASETHRESHOLD after damage (PHP/vanilla)
     ai_state: str = ""
     frame: int = 0
     tics: int = 0
@@ -230,6 +242,11 @@ def give_power(player: Player, power: int) -> bool:
 
 
 def spawn_player(world, start, cheats: int = 0) -> Player:
+    from .collision import set_thing_position
+    from .deh import deh
+    from .enemy import p_random
+    from .info import MI_SPAWNSTATE, MOBJINFO, MT_PLAYER, SPRNAMES, STATES
+
     sub = point_in_subsector(world, start.x * FRACUNIT, start.y * FRACUNIT)
     mo = Mobj(
         x=start.x * FRACUNIT,
@@ -238,11 +255,10 @@ def spawn_player(world, start, cheats: int = 0) -> Player:
         angle=as_u32((start.angle // 45) * 0x20000000),
         floorz=sub.sector.floorheight,
         ceilingz=sub.sector.ceilingheight,
+        type=MT_PLAYER,
     )
     player = Player(mo=mo, cheats=cheats)
     mo.player = player
-    from .deh import deh
-
     player.health = deh.initial_health
     mo.health = deh.initial_health
     player.ammo = [deh.initial_bullets, 0, 0, 0]
@@ -250,12 +266,15 @@ def spawn_player(world, start, cheats: int = 0) -> Player:
     if cheats & 1:
         mo.flags |= MF_NOCLIP
     player.viewz = mo.z + VIEWHEIGHT
-    from .enemy import p_random
-
+    # Must set S_PLAY before mobj_thinker runs: istate 0 is S_NULL and would remove us.
+    state = MOBJINFO[MT_PLAYER][MI_SPAWNSTATE]
+    st = STATES[state]
+    mo.istate = state
+    mo.tics = st[2]
+    mo.sprite = SPRNAMES[st[0]]
+    mo.frame = st[1]
     mo.lastlook = p_random() % 4
     world.mobjs.append(mo)
-    from .collision import set_thing_position
-
     set_thing_position(world, mo)
     return player
 
@@ -311,11 +330,15 @@ def z_movement(mo: Mobj, world=None, game=None) -> None:
 
 
 def _special_sector(world, player: Player, game, leveltime: int) -> None:
-    """P_PlayerInSpecialSector: secrets and damaging floors."""
+    """P_PlayerInSpecialSector — Harbour p_spec.prg (mo.subsector, short-circuit OR)."""
+    from .enemy import p_random
+
     mo = player.mo
     if mo is None:
         return
-    sector = point_in_subsector(world, mo.x, mo.y).sector
+    # Harbour: sector := player:mo:subsector:sector (not a fresh point query).
+    sub = getattr(mo, "subsector", None) or point_in_subsector(world, mo.x, mo.y)
+    sector = sub.sector
     if mo.z != sector.floorheight or not sector.special:
         return
     spec = sector.special
@@ -323,21 +346,26 @@ def _special_sector(world, player: Player, game, leveltime: int) -> None:
         player.secretcount += 1
         sector.special = 0
         return
-    if spec in (5, 7, 4, 16, 11):
-        if player.powers[3]:
-            return
-        if (leveltime & 0x1F) != 0:
-            return
-        if spec == 5:
-            game.damage_mobj(mo, None, 10)
-        elif spec == 7:
-            game.damage_mobj(mo, None, 5)
-        elif spec in (4, 16):
+    if spec == 11:
+        from .defs import CF_GODMODE
+
+        player.cheats &= ~CF_GODMODE
+        if (leveltime & 0x1F) == 0:
             game.damage_mobj(mo, None, 20)
-        elif spec == 11:
-            game.damage_mobj(mo, None, 20)
-            if player.health <= 10 and game.specials:
-                game.specials.exit_requested = True
+        if player.health <= 10 and game.specials:
+            game.specials.exit_requested = True
+        return
+    if spec not in (5, 7, 4, 16):
+        return
+    # CASE 4/16: ironfeet==0 .OR. P_Random()<5 (P_Random only when suit is on).
+    if spec in (4, 16):
+        if player.powers[PW_IRONFEET] and p_random() >= 5:
+            return
+    elif player.powers[PW_IRONFEET]:
+        return
+    if (leveltime & 0x1F) == 0:
+        damage = 5 if spec == 7 else (10 if spec == 5 else 20)
+        game.damage_mobj(mo, None, damage)
 
 
 def _death_think(world, player: Player, game, leveltime: int) -> None:
@@ -349,8 +377,7 @@ def _death_think(world, player: Player, game, leveltime: int) -> None:
     if player.viewheight < 6 * FRACUNIT:
         player.viewheight = 6 * FRACUNIT
     player.deltaviewheight = 0
-    xy_movement(world, mo, game)
-    z_movement(mo, world, game)
+    # XY/Z run in mobj_thinker (tick_enemies), not here.
     calc_height(player, leveltime)
     if player.attacker is not None and player.attacker is not mo:
         angle = angle_to(mo.x, mo.y, player.attacker.x, player.attacker.y)
@@ -375,29 +402,66 @@ def player_think(world, player: Player, game, leveltime: int) -> None:
     mo = player.mo
     assert mo is not None
     cmd = player.cmd
+    if mo.flags & MF_JUSTATTACKED:
+        cmd.angleturn = 0
+        cmd.forwardmove = 0xC800 // 512
+        cmd.sidemove = 0
+        mo.flags &= ~MF_JUSTATTACKED
     if player.playerstate == PST_DEAD:
         _death_think(world, player, game, leveltime)
         return
-    mo.angle = as_u32(mo.angle + (cmd.angleturn << 16))
-    onground = mo.z <= mo.floorz
-    if cmd.forwardmove and onground:
-        thrust(mo, mo.angle, cmd.forwardmove * 2048)
-    if cmd.sidemove and onground:
-        thrust(mo, as_u32(mo.angle - ANG90), cmd.sidemove * 2048)
-    xy_movement(world, mo, game)
-    z_movement(mo, world, game)
+    if mo.reactiontime:
+        mo.reactiontime -= 1
+    else:
+        mo.angle = as_u32(mo.angle + (cmd.angleturn << 16))
+        if mo.z <= mo.floorz:
+            if cmd.forwardmove:
+                thrust(mo, mo.angle, cmd.forwardmove * 2048)
+            if cmd.sidemove:
+                thrust(mo, as_u32(mo.angle - ANG90), cmd.sidemove * 2048)
+        # XY/Z run in mobj_thinker (tick_enemies), not here.
+        from .info import S_PLAY, S_PLAY_RUN1
+        from .thinker import set_mobj_state
+
+        if (cmd.forwardmove or cmd.sidemove) and mo.istate == S_PLAY:
+            set_mobj_state(mo, S_PLAY_RUN1, world, game)
     calc_height(player, leveltime)
     _special_sector(world, player, game, leveltime)
+    # P_PlayerThink: BT_SPECIAL clears other buttons; then weapon change; then use.
+    if cmd.buttons & BT_SPECIAL:
+        cmd.buttons = 0
+    if cmd.buttons & BT_CHANGE:
+        # Fist↔chainsaw and shotgun↔SSG remaps (vanilla / demos).
+        neww = (cmd.buttons & BT_WEAPONMASK) >> BT_WEAPONSHIFT
+        if (
+            neww == WP_FIST
+            and player.weaponowned[WP_CHAINSAW]
+            and not (player.readyweapon == WP_CHAINSAW and player.powers[PW_STRENGTH])
+        ):
+            neww = WP_CHAINSAW
+        wad = getattr(game, "wad", None)
+        commercial = wad is not None and wad.check_num_for_name("MAP01") >= 0
+        shareware = (not commercial) and wad is not None and wad.check_num_for_name("E2M1") < 0
+        if (
+            commercial
+            and neww == WP_SHOTGUN
+            and player.weaponowned[WP_SUPERSHOTGUN]
+            and player.readyweapon != WP_SUPERSHOTGUN
+        ):
+            neww = WP_SUPERSHOTGUN
+        if (
+            player.weaponowned[neww]
+            and neww != player.readyweapon
+            and 0 <= neww <= WP_SUPERSHOTGUN
+            and ((neww != WP_PLASMA and neww != WP_BFG) or not shareware)
+        ):
+            player.pendingweapon = neww
     if cmd.buttons & BT_USE:
         if not player.usedown:
             use_lines(world, player, game)
             player.usedown = True
     else:
         player.usedown = False
-    if cmd.buttons & BT_CHANGE:
-        neww = (cmd.buttons & BT_WEAPONMASK) >> BT_WEAPONSHIFT
-        if 0 <= neww <= WP_SUPERSHOTGUN and player.weaponowned[neww] and neww != player.readyweapon:
-            player.pendingweapon = neww
     _weapon_think(player, game)
     if player.powers[PW_STRENGTH]:
         player.powers[PW_STRENGTH] += 1
@@ -487,21 +551,21 @@ WEAPON_FIRE_BODY = {
     WP_SUPERSHOTGUN: "SHT2A0",
 }
 
-# info.prg attack states: (body, tics, do_fire, flash, flash_tics, light)
-# A_ReFire is the end of the list (restart while held).
+# Attack states: (body, tics, do_fire, flash, flash_tics, light[, refire])
+# Trailing True = A_ReFire (bump refire before CheckAmmo / restart).
 WEAPON_ATK = {
     WP_FIST: (
         ("PUNGB0", 4, False, "", 0, 0),
         ("PUNGC0", 4, True, "", 0, 0),
         ("PUNGD0", 5, False, "", 0, 0),
         ("PUNGC0", 4, False, "", 0, 0),
-        ("PUNGB0", 5, False, "", 0, 0),
+        ("PUNGB0", 5, False, "", 0, 0, True),
     ),
     WP_PISTOL: (
         ("PISGA0", 4, False, "", 0, 0),
         ("PISGB0", 6, True, "PISFA0", 7, 1),
         ("PISGC0", 4, False, "", 0, 0),
-        ("PISGB0", 5, False, "", 0, 0),
+        ("PISGB0", 5, False, "", 0, 0, True),
     ),
     WP_SHOTGUN: (
         ("SHTGA0", 3, False, "", 0, 0),
@@ -512,42 +576,48 @@ WEAPON_ATK = {
         ("SHTGC0", 5, False, "", 0, 0),
         ("SHTGB0", 5, False, "", 0, 0),
         ("SHTGA0", 3, False, "", 0, 0),
-        ("SHTGA0", 7, False, "", 0, 0),
+        ("SHTGA0", 7, False, "", 0, 0, True),
     ),
+    # S_CHAIN1 Fire, S_CHAIN2 Fire, S_CHAIN3 ReFire (tics 0).
     WP_CHAINGUN: (
         ("CHGGA0", 4, True, "CHGFA0", 5, 1),
         ("CHGGB0", 4, True, "CHGFB0", 5, 2),
+        ("CHGGA0", 0, False, "", 0, 0, True),
     ),
+    # S_MISSILE1 flash 3, S_MISSILE2 Fire, S_MISSILE3 ReFire 0
     WP_MISSILE: (
-        ("MISGB0", 8, False, "MISFA0", 15, 1),
+        ("MISGB0", 8, False, "MISFA0", 3, 1),
         ("MISGB0", 12, True, "", 0, 2),
+        ("MISGA0", 0, False, "", 0, 0, True),
     ),
     WP_PLASMA: (
         ("PLSGA0", 3, True, "PLSFA0", 4, 1),
-        # A_ReFire: entering this frame restarts the shot while attack is held.
         ("PLSGB0", 20, False, "", 0, 0, True),
     ),
     WP_BFG: (
         ("BFGGA0", 20, False, "", 0, 0),
-        ("BFGGB0", 10, False, "BFGFA0", 17, 1),
+        ("BFGGB0", 10, False, "BFGFA0", 11, 1),
         ("BFGGB0", 10, True, "", 0, 2),
-        ("BFGGB0", 20, False, "", 0, 0),
+        ("BFGGB0", 20, False, "", 0, 0, True),
     ),
+    # S_SAW2/S_SAW3: A_Saw loops with no A_ReFire.
     WP_CHAINSAW: (
         ("SAWGA0", 4, True, "", 0, 0),
         ("SAWGB0", 4, True, "", 0, 0),
     ),
+    # Vanilla S_DSGUN*: CloseShotgun2 calls A_ReFire (skips DSGUN9/10 when holding fire).
+    # step[6]: True = A_ReFire; "checkreload" = A_CheckReload (P_CheckAmmo).
     WP_SUPERSHOTGUN: (
-        ("SHT2A0", 3, False, "", 0, 0),
-        ("SHT2A0", 7, True, "SHT2I0", 9, 1),
-        ("SHT2B0", 7, False, "", 0, 0),
-        ("SHT2C0", 7, False, "", 0, 0),
-        ("SHT2D0", 7, False, "", 0, 0),
-        ("SHT2E0", 7, False, "", 0, 0),
-        ("SHT2F0", 7, False, "", 0, 0),
-        ("SHT2G0", 6, False, "", 0, 0),
-        ("SHT2H0", 6, False, "", 0, 0),
-        ("SHT2A0", 5, False, "", 0, 0),
+        ("SHT2A0", 3, False, "", 0, 0),  # S_DSGUN1
+        ("SHT2A0", 7, True, "SHT2I0", 9, 1),  # S_DSGUN2 A_FireShotgun2
+        ("SHT2B0", 7, False, "", 0, 0),  # S_DSGUN3
+        ("SHT2C0", 7, False, "", 0, 0, "checkreload"),  # S_DSGUN4 A_CheckReload
+        ("SHT2D0", 7, False, "", 0, 0),  # S_DSGUN5 A_OpenShotgun2
+        ("SHT2E0", 7, False, "", 0, 0),  # S_DSGUN6
+        ("SHT2F0", 7, False, "", 0, 0),  # S_DSGUN7 A_LoadShotgun2
+        ("SHT2G0", 6, False, "", 0, 0),  # S_DSGUN8
+        ("SHT2H0", 6, False, "", 0, 0, True),  # S_DSGUN9 A_CloseShotgun2 → A_ReFire
+        ("SHT2A0", 5, False, "", 0, 0, True),  # S_DSGUN10 A_ReFire
     ),
 }
 
@@ -557,6 +627,41 @@ WEAPON_READY = {
 }
 
 
+def _select_fallback(player: Player, game) -> None:
+    """P_CheckAmmo: Harbour preference order when the ready weapon is empty."""
+    wad = getattr(game, "wad", None)
+    commercial = wad is not None and wad.check_num_for_name("MAP01") >= 0
+    shareware = (not commercial) and wad is not None and wad.check_num_for_name("E2M1") < 0
+    if player.weaponowned[WP_PLASMA] and player.ammo[AM_CELL] != 0 and not shareware:
+        player.pendingweapon = WP_PLASMA
+    elif player.weaponowned[WP_SUPERSHOTGUN] and player.ammo[AM_SHELL] > 2 and commercial:
+        player.pendingweapon = WP_SUPERSHOTGUN
+    elif player.weaponowned[WP_CHAINGUN] and player.ammo[AM_CLIP] != 0:
+        player.pendingweapon = WP_CHAINGUN
+    elif player.weaponowned[WP_SHOTGUN] and player.ammo[AM_SHELL] != 0:
+        player.pendingweapon = WP_SHOTGUN
+    elif player.ammo[AM_CLIP] != 0:
+        player.pendingweapon = WP_PISTOL
+    elif player.weaponowned[WP_CHAINSAW]:
+        player.pendingweapon = WP_CHAINSAW
+    elif player.weaponowned[WP_MISSILE] and player.ammo[AM_MISL] != 0:
+        player.pendingweapon = WP_MISSILE
+    elif player.weaponowned[WP_BFG] and player.ammo[AM_CELL] > 40 and not shareware:
+        player.pendingweapon = WP_BFG
+    else:
+        player.pendingweapon = WP_FIST
+
+
+def _weapon_ready_bob(player: Player, game) -> None:
+    """A_WeaponReady bob into psp->sy (Harbour: finesine[(angle & halfmask)])."""
+    from .tables import finesine
+
+    lt = int(getattr(game, "leveltime", 0) or 0)
+    angle = (128 * lt) & FINEMASK
+    angle &= FINEANGLES // 2 - 1
+    player.psprite_sy = WEAPONTOP + fixed_mul(player.bob or 0, finesine[angle])
+
+
 def _weapon_think(player: Player, game) -> None:
     if player.playerstate == PST_DEAD or player.health <= 0:
         _lower_weapon(player, game)
@@ -564,19 +669,8 @@ def _weapon_think(player: Player, game) -> None:
     cmd = player.cmd
     firing = bool(cmd.buttons & BT_ATTACK)
     ammo_type = WEAPON_AMMO.get(player.readyweapon)
-    can_fire = True
     need = _ammo_needed(player.readyweapon)
-    if ammo_type is not None and player.ammo[ammo_type] < need:
-        can_fire = player.readyweapon in (WP_FIST, WP_CHAINSAW)
-        if not can_fire:
-            for w in (WP_PISTOL, WP_SHOTGUN, WP_CHAINGUN, WP_MISSILE, WP_PLASMA, WP_BFG, WP_FIST):
-                at = WEAPON_AMMO.get(w)
-                wneed = _ammo_needed(w)
-                if player.weaponowned[w] and (at is None or player.ammo[at] >= wneed):
-                    player.pendingweapon = w
-                    break
-            ammo_type = WEAPON_AMMO.get(player.readyweapon)
-            can_fire = ammo_type is None or player.ammo[ammo_type] >= _ammo_needed(player.readyweapon)
+    can_fire = ammo_type is None or player.ammo[ammo_type] >= need
     if player.flash_tics > 0:
         player.flash_tics -= 1
         if player.flash_tics <= 0:
@@ -594,25 +688,36 @@ def _weapon_think(player: Player, game) -> None:
         player.psprite_step += 1
         _enter_atk_step(player, game, ammo_type, firing, can_fire)
         return
+    # A_Raise ignores pending; only A_WeaponReady starts the lower (PHP/vanilla).
+    if player.psprite_state == "up":
+        _raise_weapon(player, game)
+        return
     if player.pendingweapon != WP_NOCHANGE or player.psprite_state == "down":
         _lower_weapon(player, game)
         return
-    if player.psprite_state == "up":
-        _raise_weapon(player, game)
+    if firing and not can_fire:
+        _select_fallback(player, game)
+        _lower_weapon(player, game)
         return
     if firing and can_fire:
         ready_gate = (not player.attackdown) or player.readyweapon not in (WP_MISSILE, WP_BFG)
         if ready_gate:
             player.psprite_state = "atk"
             player.psprite_step = 0
-            player.psprite_sy = WEAPONTOP
+            # Harbour P_FireWeapon keeps psp->sy (bobbed); do not snap to WEAPONTOP.
             player.attackdown = True
             _enter_atk_step(player, game, ammo_type, firing, can_fire)
             return
     if player.psprite_state != "ready":
         _start_ready(player, game)
+        _weapon_ready_bob(player, game)
+        if not firing:
+            player.attackdown = False
+            player.refire = 0
         return
     _tick_ready(player, game)
+    # A_WeaponReady: bob into psp->sy so A_Lower starts from WEAPONTOP+bob.
+    _weapon_ready_bob(player, game)
     if not firing:
         player.attackdown = False
         player.refire = 0
@@ -636,17 +741,43 @@ def _lower_weapon(player: Player, game) -> None:
         game.start_sound("sawup")
     player.psprite_state = "up"
     player.psprite_body = WEAPON_PATCH.get(player.readyweapon, "PISGA0")
+    # A_Lower calls P_BringUpWeapon, which runs A_Raise on the same tic.
+    _raise_weapon(player, game)
 
 
 def _raise_weapon(player: Player, game) -> None:
-    """A_Raise: slide up from WEAPONBOTTOM to WEAPONTOP."""
+    """A_Raise: slide up from WEAPONBOTTOM to WEAPONTOP; then A_WeaponReady same tic."""
     player.psprite_sy -= RAISESPEED
     if not player.psprite_body:
         player.psprite_body = WEAPON_PATCH.get(player.readyweapon, "PISGA0")
     if player.psprite_sy > WEAPONTOP:
         return
     player.psprite_sy = WEAPONTOP
+    # Harbour A_Raise → P_SetPsprite(readystate) → A_WeaponReady immediately.
+    if player.pendingweapon != WP_NOCHANGE or player.health <= 0:
+        _lower_weapon(player, game)
+        return
     _start_ready(player, game)
+    cmd = player.cmd
+    firing = bool(cmd.buttons & BT_ATTACK)
+    ammo_type = WEAPON_AMMO.get(player.readyweapon)
+    can_fire = ammo_type is None or player.ammo[ammo_type] >= _ammo_needed(player.readyweapon)
+    if firing and not can_fire:
+        _select_fallback(player, game)
+        _lower_weapon(player, game)
+        return
+    if firing and can_fire and (
+        (not player.attackdown) or player.readyweapon not in (WP_MISSILE, WP_BFG)
+    ):
+        player.psprite_state = "atk"
+        player.psprite_step = 0
+        player.attackdown = True
+        _enter_atk_step(player, game, ammo_type, firing, can_fire)
+        return
+    _weapon_ready_bob(player, game)
+    if not firing:
+        player.attackdown = False
+        player.refire = 0
 
 
 def _start_ready(player: Player, game) -> None:
@@ -682,10 +813,19 @@ def _tick_ready(player: Player, game) -> None:
 
 
 def _enter_atk_step(player: Player, game, ammo_type, firing: bool, can_fire: bool) -> None:
+    from .enemy import noise_alert
+
     seq = WEAPON_ATK.get(player.readyweapon) or WEAPON_ATK[WP_PISTOL]
-    while True:
+    for _guard in range(64):
         if player.psprite_step >= len(seq):
-            # A_ReFire: restart the attack if still held, else drop to ready.
+            if player.pendingweapon != WP_NOCHANGE:
+                _lower_weapon(player, game)
+                return
+            if firing and not can_fire:
+                # Harbour A_ReFire / end-of-atk: P_CheckAmmo preference order.
+                _select_fallback(player, game)
+                _lower_weapon(player, game)
+                return
             if firing and can_fire and player.pendingweapon == WP_NOCHANGE:
                 player.psprite_step = 0
                 continue
@@ -694,19 +834,32 @@ def _enter_atk_step(player: Player, game, ammo_type, firing: bool, can_fire: boo
                 player.attackdown = False
                 player.refire = 0
             return
+        if player.psprite_step == 0 and player.mo is not None:
+            noise_alert(game.world, player.mo, game)
         step = seq[player.psprite_step]
         body, tics, do_fire, flash, flash_tics, light = step[:6]
-        # Held fire skips the cooldown the moment the ReFire frame is entered.
-        if (
-            len(step) > 6
-            and step[6]
-            and firing
-            and can_fire
-            and player.pendingweapon == WP_NOCHANGE
-            and player.health > 0
-        ):
-            player.psprite_step = 0
-            continue
+        action = step[6] if len(step) > 6 else None
+        # A_CheckReload: P_CheckAmmo mid-anim (SSG); lower if empty.
+        if action == "checkreload":
+            if not can_fire:
+                _select_fallback(player, game)
+                _lower_weapon(player, game)
+                return
+        # A_ReFire (and A_CloseShotgun2→A_ReFire): bump refire; held fire skips remaining tics.
+        elif action:
+            if firing and player.pendingweapon == WP_NOCHANGE and player.health > 0:
+                player.refire += 1
+                if can_fire:
+                    player.psprite_step = 0
+                    continue
+                _select_fallback(player, game)
+                _lower_weapon(player, game)
+                return
+            player.refire = 0
+            if not can_fire:
+                _select_fallback(player, game)
+                _lower_weapon(player, game)
+                return
         player.psprite_body = body
         player.psprite_tics = tics
         if flash_tics:
@@ -722,24 +875,28 @@ def _enter_atk_step(player: Player, game, ammo_type, firing: bool, can_fire: boo
 
 
 def _ammo_needed(weapon: int) -> int:
+    """P_CheckAmmo / DecreaseAmmo: BFG cells, SSG 2 shells, else 1."""
     if weapon == WP_BFG:
         from .deh import deh
 
         return deh.bfg_cells_per_shot
+    if weapon == WP_SUPERSHOTGUN:
+        return 2
     return 1
 
 
-def _gun_shot(player: Player, game, accurate: bool) -> bool:
-    """P_GunShot."""
+def _gun_shot(player: Player, game, accurate: bool, slope: int | None = None) -> bool:
+    """P_GunShot — re-reads global bulletslope each call (InterceptsOverrun)."""
     from .enemy import p_random
 
     mo = player.mo
-    slope = bullet_slope(game.world, mo)
     damage = 5 * ((p_random() % 3) + 1)
     angle = mo.angle
     if not accurate:
         angle = as_u32(angle + (p_random() - p_random()) * 262144)
-    return line_attack(game.world, mo, damage, game, MISSILERANGE, angle, slope)
+    # Vanilla reads the global each pellet; PathTraverse may clobber it.
+    aim = get_bulletslope() if slope is None else slope
+    return line_attack(game.world, mo, damage, game, MISSILERANGE, angle, aim)
 
 
 def _do_shot(player: Player, game, ammo_type) -> None:
@@ -758,15 +915,15 @@ def _do_shot(player: Player, game, ammo_type) -> None:
             player.psprite_flash = "PLSFB0" if (p_random() & 1) else "PLSFA0"
             player.flash_tics = 4
         if weapon == WP_MISSILE:
-            spawn_player_missile(game.world, mo, "MISL", 20 * FRACUNIT, 20, "rocket")
+            spawn_player_missile(game.world, mo, "MISL", 20 * FRACUNIT, 20, "rocket", game)
             game.start_sound("rlaunc")
         elif weapon == WP_PLASMA:
-            spawn_player_missile(game.world, mo, "PLSS", 25 * FRACUNIT, 5, "plasma")
+            spawn_player_missile(game.world, mo, "PLSS", 25 * FRACUNIT, 5, "plasma", game)
             game.start_sound("plasma")
         else:
-            spawn_player_missile(game.world, mo, "BFS1", 25 * FRACUNIT, 100, "bfg")
+            spawn_player_missile(game.world, mo, "BFS1", 25 * FRACUNIT, 100, "bfg", game)
             game.start_sound("bfg")
-        player.refire += 1
+        # refire is only bumped in A_ReFire, not here.
         player.attackdown = True
         noise_alert(game.world, mo, game)
         return
@@ -784,23 +941,26 @@ def _do_shot(player: Player, game, ammo_type) -> None:
         hit = line_attack(game.world, mo, damage, game, MELEERANGE + 1, angle)
         game.start_sound("sawhit" if hit else "sawful")
     elif mo and weapon == WP_SHOTGUN:
+        # A_FireShotgun: one P_BulletSlope, then 7× P_GunShot reading global.
         game.start_sound("shotgn")
+        bullet_slope(game.world, mo)
         for _ in range(7):
             if _gun_shot(player, game, False):
                 hit = True
     elif mo and weapon == WP_SUPERSHOTGUN:
         game.start_sound("dshtgn")
-        slope = bullet_slope(game.world, mo)
+        bullet_slope(game.world, mo)
         for _ in range(20):
             damage = 5 * ((p_random() % 3) + 1)
             angle = as_u32(mo.angle + (p_random() - p_random()) * 524288)
-            pellet = slope + (p_random() - p_random()) * 32
+            pellet = get_bulletslope() + (p_random() - p_random()) * 32
             if line_attack(game.world, mo, damage, game, MISSILERANGE, angle, pellet):
                 hit = True
     elif mo:
         game.start_sound("pistol")
+        bullet_slope(game.world, mo)
         _gun_shot(player, game, player.refire == 0)
-    player.refire += 1
+    # refire is only bumped in A_ReFire, not here (P_FireWeapon / A_FirePistol).
     player.attackdown = True
     if mo:
         noise_alert(game.world, mo, game)

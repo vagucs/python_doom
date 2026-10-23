@@ -18,6 +18,7 @@ import struct
 import sys
 from dataclasses import dataclass, field
 
+from .collision import point_in_subsector
 from .compat import as_i32, as_u32, fixed_div, fixed_mul
 from .defs import (
     ANG45,
@@ -154,6 +155,13 @@ def draw_sprites(renderer, world, fb: bytearray) -> None:
     vis = []
     for mo in world.mobjs:
         if not mo.sprite or mo.player is not None or (mo.flags & MF_NOSECTOR):
+            continue
+        # Harbour R_AddSprites: only project things whose sector was visited
+        # in this frame's BSP (validcount). Prevents sprites "through walls"
+        # when their sector is fully occluded (e.g. sergeant behind yellow door).
+        sub = getattr(mo, "subsector", None) or point_in_subsector(world, mo.x, mo.y)
+        sec = sub.sector if sub is not None else None
+        if sec is None or sec.validcount != world.validcount:
             continue
         item = _project(renderer, mo)
         if item is not None:
@@ -327,7 +335,7 @@ def draw_psprite(renderer, fb: bytearray, patch: bytes, sx: int, sy: int) -> Non
 
 
 def weapon_psprite_xy(player, leveltime: int) -> tuple[int, int]:
-    """A_WeaponReady bob, or A_Raise/A_Lower sy while switching weapons."""
+    """Bob for draw only — do not write psprite_sy (think already set it)."""
     from .tables import finesine
 
     state = getattr(player, "psprite_state", "ready")
@@ -339,8 +347,9 @@ def weapon_psprite_xy(player, leveltime: int) -> tuple[int, int]:
     angle = (128 * leveltime) & FINEMASK
     sx = FRACUNIT + fixed_mul(bob, finesine[(angle + FINEANGLES // 4) % len(finesine)])
     angle &= FINEANGLES // 2 - 1
+    # Do not write psprite_sy here: draw runs after leveltime++ and would
+    # desync A_Lower's starting height from A_WeaponReady.
     sy = WEAPONTOP + fixed_mul(bob, finesine[angle])
-    player.psprite_sy = sy
     return sx, sy
 
 

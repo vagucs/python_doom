@@ -51,6 +51,15 @@ def fixed_mul(a: int, b: int) -> int:
     return as_i32((as_i32(a) * as_i32(b)) >> FRACBITS)
 
 
+def div_trunc(n: int, d: int) -> int:
+    """C / Harbour integer division: truncate toward zero (not Python //)."""
+    if d == 0:
+        raise ZeroDivisionError("div_trunc")
+    neg = (n < 0) != (d < 0)
+    q = abs(n) // abs(d)
+    return -q if neg else q
+
+
 def fixed_div(a: int, b: int) -> int:
     a = as_i32(a)
     b = as_i32(b)
@@ -60,7 +69,7 @@ def fixed_div(a: int, b: int) -> int:
     abs_b = -b if b < 0 else b
     if (abs_a >> 14) >= abs_b:
         return as_i32(-0x80000000) if (a ^ b) < 0 else 0x7FFFFFFF
-    return as_i32((a << 16) // b)
+    return as_i32(div_trunc(a << 16, b))
 
 
 def abs_fixed(n: int) -> int:

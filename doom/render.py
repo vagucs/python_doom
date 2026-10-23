@@ -21,6 +21,10 @@ from .defs import (
     ANGLETOFINESHIFT,
     ANG90,
     ANG180,
+    BOXBOTTOM,
+    BOXLEFT,
+    BOXRIGHT,
+    BOXTOP,
     DBITS,
     FIELDOFVIEW,
     FINEANGLES,
@@ -53,6 +57,23 @@ ANGLETOSKYSHIFT = 22
 SHRT_MAX = 0x7FFF
 INT_MAX = 0x7FFFFFFF
 INT_MIN = -0x7FFFFFFF
+
+# Corner picks for R_CheckBBox, remapped from vanilla indices
+# (TOP=0,BOTTOM=1,LEFT=2,RIGHT=3) into defs (LEFT=0,RIGHT=1,BOTTOM=2,TOP=3).
+CHECKCOORD = (
+    (BOXRIGHT, BOXTOP, BOXLEFT, BOXBOTTOM),
+    (BOXRIGHT, BOXTOP, BOXLEFT, BOXTOP),
+    (BOXRIGHT, BOXBOTTOM, BOXLEFT, BOXTOP),
+    (0, 0, 0, 0),
+    (BOXLEFT, BOXTOP, BOXLEFT, BOXBOTTOM),
+    (0, 0, 0, 0),
+    (BOXRIGHT, BOXBOTTOM, BOXRIGHT, BOXTOP),
+    (0, 0, 0, 0),
+    (BOXLEFT, BOXTOP, BOXRIGHT, BOXBOTTOM),
+    (BOXLEFT, BOXBOTTOM, BOXRIGHT, BOXBOTTOM),
+    (BOXLEFT, BOXBOTTOM, BOXRIGHT, BOXTOP),
+    (0, 0, 0, 0),
+)
 
 
 @dataclass
@@ -150,6 +171,18 @@ class Renderer:
         self.drawsegs: list[DrawSeg] = []
         self.basexscale = 0
         self.baseyscale = 0
+        # R_MakeSpans / R_MapPlane working state (Harbour r_plane.prg).
+        self.spanstart = [0] * SCREENHEIGHT
+        self.cachedheight = [0] * SCREENHEIGHT
+        self.cacheddistance = [0] * SCREENHEIGHT
+        self.cachedxstep = [0] * SCREENHEIGHT
+        self.cachedystep = [0] * SCREENHEIGHT
+        self.planeheight = 0
+        self.planezlight: list = [0] * MAXLIGHTZ
+        self.ds_source = bytes(4096)
+        self.ds_colormap = bytes(range(256))
+        self.ds_y = self.ds_x1 = self.ds_x2 = 0
+        self.ds_xfrac = self.ds_yfrac = self.ds_xstep = self.ds_ystep = 0
         self._init_mapping()
         self._init_lights()
         self._init_slopes()
@@ -299,11 +332,16 @@ class Renderer:
         ang = ushr(as_u32(self.viewangle - ANG90), ANGLETOFINESHIFT) & FINEMASK
         self.basexscale = fixed_div(finesine[(ang + FINEANGLES // 4) & FINEMASK], self.centerxfrac or 1)
         self.baseyscale = -fixed_div(finesine[ang], self.centerxfrac or 1)
+        for i in range(SCREENHEIGHT):
+            self.cachedheight[i] = 0
 
     def render(self, world, fb: bytearray) -> None:
         self.fb = fb
         self.visplanes = []
         self.drawsegs = []
+        # Same as R_SetupFrame: sprites are only projected for sectors
+        # marked with this frame's validcount during BSP traversal.
+        world.validcount += 1
         self._clear_clip()
         if world.nodes:
             self._render_bsp_node(world, world.numnodes - 1)
@@ -374,11 +412,71 @@ class Renderer:
         node = world.nodes[bspnum]
         side = self.point_on_side(self.viewx, self.viewy, node)
         self._render_bsp_node(world, node.children[side])
-        self._render_bsp_node(world, node.children[side ^ 1])
+        # Harbour/vanilla: only descend the far child if its bbox is visible.
+        if self._check_bbox(node.bbox[side ^ 1]):
+            self._render_bsp_node(world, node.children[side ^ 1])
+
+    def _check_bbox(self, bspcoord: list) -> bool:
+        """R_CheckBBox: reject BSP children fully occluded by solidsegs / FOV."""
+        if self.viewx <= bspcoord[BOXLEFT]:
+            boxx = 0
+        elif self.viewx < bspcoord[BOXRIGHT]:
+            boxx = 1
+        else:
+            boxx = 2
+        if self.viewy >= bspcoord[BOXTOP]:
+            boxy = 0
+        elif self.viewy > bspcoord[BOXBOTTOM]:
+            boxy = 1
+        else:
+            boxy = 2
+        boxpos = (boxy << 2) + boxx
+        if boxpos == 5:
+            return True
+        c = CHECKCOORD[boxpos]
+        x1 = bspcoord[c[0]]
+        y1 = bspcoord[c[1]]
+        x2 = bspcoord[c[2]]
+        y2 = bspcoord[c[3]]
+        angle1 = as_u32(self.point_to_angle(x1, y1) - self.viewangle)
+        angle2 = as_u32(self.point_to_angle(x2, y2) - self.viewangle)
+        span = as_u32(angle1 - angle2)
+        if span >= ANG180:
+            return True
+        tspan = as_u32(angle1 + self.clipangle)
+        if tspan > as_u32(2 * self.clipangle):
+            tspan = as_u32(tspan - 2 * self.clipangle)
+            if tspan >= span:
+                return False
+            angle1 = self.clipangle
+        tspan = as_u32(self.clipangle - angle2)
+        if tspan > as_u32(2 * self.clipangle):
+            tspan = as_u32(tspan - 2 * self.clipangle)
+            if tspan >= span:
+                return False
+            angle2 = as_u32(-self.clipangle)
+        mask = FINEANGLES // 2 - 1
+        sx1 = self.viewangletox[ushr(as_u32(angle1 + ANG90), ANGLETOFINESHIFT) & mask]
+        sx2 = self.viewangletox[ushr(as_u32(angle2 + ANG90), ANGLETOFINESHIFT) & mask]
+        if sx1 == sx2:
+            return False
+        sx2 -= 1
+        start = 0
+        while start < self.newend and self.solidsegs[start].last < sx2:
+            start += 1
+        if start >= self.newend:
+            return True
+        if sx1 >= self.solidsegs[start].first and sx2 <= self.solidsegs[start].last:
+            return False
+        return True
 
     def _subsector(self, world, num: int) -> None:
         sub = world.subsectors[num]
         self.frontsector = sub.sector
+        # Mark sector for this frame so sprites are only drawn from visited sectors
+        # (R_AddSprites / validcount), matching Harbour/PHP.
+        if self.frontsector.validcount != world.validcount:
+            self.frontsector.validcount = world.validcount
         light = (self.frontsector.lightlevel >> 4) + self.extralight
         light = max(0, min(LIGHTLEVELS - 1, light))
         self.walllights = self.scalelight[light]
@@ -760,39 +858,34 @@ class Renderer:
             self.rw_x += 1
 
     def _draw_column(self) -> None:
+        """R_DrawColumn / R_DrawColumnLow — dc_source is always 128 bytes, colormap 256."""
         count = self.dc_yh - self.dc_yl
-        if count < 0 or self.dc_x < 0 or self.dc_x >= self.viewwidth:
+        if count < 0:
             return
-        yl = max(0, min(SCREENHEIGHT - 1, self.dc_yl))
-        if self.detailshift:
-            x = self.dc_x << 1
-            if x < 0 or x + 1 >= SCREENWIDTH:
-                return
-            dest = self.ylookup[yl] + self.columnofs[x]
-            dest2 = dest + 1
-        else:
-            dest = self.ylookup[yl] + self.columnofs[self.dc_x]
-            dest2 = None
         fracstep = self.dc_iscale
         frac = self.dc_texturemid + (self.dc_yl - self.centery) * fracstep
         src = self.dc_source
         cm = self.dc_colormap
         fb = self.fb
-        slen = len(src)
-        limit = SCREENWIDTH * SCREENHEIGHT
-        while count >= 0 and dest < limit:
-            idx = (frac >> FRACBITS) & 127
-            if slen:
-                pix = src[idx % slen]
-                val = cm[pix] if pix < len(cm) else pix
+        pitch = SCREENWIDTH
+        if self.detailshift:
+            x = self.dc_x << 1
+            dest = self.ylookup[self.dc_yl] + self.columnofs[x]
+            while count >= 0:
+                pix = src[(frac >> FRACBITS) & 127]
+                val = cm[pix]
                 fb[dest] = val
-                if dest2 is not None and dest2 < limit:
-                    fb[dest2] = val
-            dest += SCREENWIDTH
-            if dest2 is not None:
-                dest2 += SCREENWIDTH
-            frac = as_i32(frac + fracstep)
-            count -= 1
+                fb[dest + 1] = val
+                dest += pitch
+                frac += fracstep
+                count -= 1
+        else:
+            dest = self.ylookup[self.dc_yl] + self.columnofs[self.dc_x]
+            while count >= 0:
+                fb[dest] = cm[src[(frac >> FRACBITS) & 127]]
+                dest += pitch
+                frac += fracstep
+                count -= 1
 
     def draw_masked(self) -> None:
         """R_DrawMasked leftover two-sided mids (after sprites)."""
@@ -878,8 +971,103 @@ class Renderer:
                 self._draw_column()
         self.dc_texturemid = basemid
 
+    @staticmethod
+    def _plane_top(pl: Visplane, x: int) -> int:
+        """PlaneTopAt — out-of-range sentinel 255 closes/opens spans."""
+        if x < 0 or x >= SCREENWIDTH:
+            return 255
+        return pl.top[x]
+
+    @staticmethod
+    def _plane_bottom(pl: Visplane, x: int) -> int:
+        """PlaneBottomAt — out-of-range sentinel 0."""
+        if x < 0 or x >= SCREENWIDTH:
+            return 0
+        return pl.bottom[x]
+
+    def _map_plane(self, y: int, x1: int, x2: int) -> None:
+        """R_MapPlane: one horizontal floor/ceiling span at screen row y."""
+        if y < 0 or y >= self.viewheight or x1 > x2:
+            return
+        if self.planeheight != self.cachedheight[y]:
+            self.cachedheight[y] = self.planeheight
+            distance = fixed_mul(self.planeheight, self.yslope[y])
+            self.cacheddistance[y] = distance
+            self.cachedxstep[y] = fixed_mul(distance, self.basexscale)
+            self.cachedystep[y] = fixed_mul(distance, self.baseyscale)
+        else:
+            distance = self.cacheddistance[y]
+        self.ds_xstep = self.cachedxstep[y]
+        self.ds_ystep = self.cachedystep[y]
+        length = fixed_mul(distance, self.distscale[x1])
+        ang = ushr(as_u32(self.viewangle + self.xtoviewangle[x1]), ANGLETOFINESHIFT) & FINEMASK
+        self.ds_xfrac = self.viewx + fixed_mul(finesine[(ang + FINEANGLES // 4) & FINEMASK], length)
+        self.ds_yfrac = -self.viewy - fixed_mul(finesine[ang], length)
+        if self.fixedcolormap is not None:
+            self.ds_colormap = self.fixedcolormap
+        else:
+            index = min(MAXLIGHTZ - 1, ushr(distance, LIGHTZSHIFT))
+            self.ds_colormap = self.res.colormap(self.planezlight[index])
+        self.ds_y = y
+        self.ds_x1 = x1
+        self.ds_x2 = x2
+        self._draw_span()
+
+    def _make_spans(self, x: int, t1: int, b1: int, t2: int, b2: int) -> None:
+        """R_MakeSpans: emit completed horizontal spans, open new ones."""
+        while t1 < t2 and t1 <= b1:
+            self._map_plane(t1, self.spanstart[t1], x - 1)
+            t1 += 1
+        while b1 > b2 and b1 >= t1:
+            self._map_plane(b1, self.spanstart[b1], x - 1)
+            b1 -= 1
+        while t2 < t1 and t2 <= b2:
+            self.spanstart[t2] = x
+            t2 += 1
+        while b2 > b1 and b2 >= t2:
+            self.spanstart[b2] = x
+            b2 -= 1
+
+    def _draw_span(self) -> None:
+        """R_DrawSpan / R_DrawSpanLow — walk one horizontal span."""
+        y = self.ds_y
+        x1 = self.ds_x1
+        x2 = self.ds_x2
+        xfrac = self.ds_xfrac
+        yfrac = self.ds_yfrac
+        xstep = self.ds_xstep
+        ystep = self.ds_ystep
+        flat = self.ds_source
+        cm = self.ds_colormap
+        fb = self.fb
+        flat_len = len(flat)
+        if self.detailshift:
+            x1 <<= 1
+            x2 <<= 1
+            dest = self.ylookup[y] + self.columnofs[x1]
+            count = (x2 - x1) >> 1
+            while count >= 0:
+                spot = ((xfrac >> 16) & 63) | ((yfrac >> 10) & 0x0FC0)
+                pix = cm[flat[spot] if spot < flat_len else 0]
+                fb[dest] = pix
+                fb[dest + 1] = pix
+                dest += 2
+                xfrac = as_i32(xfrac + xstep)
+                yfrac = as_i32(yfrac + ystep)
+                count -= 1
+        else:
+            dest = self.ylookup[y] + self.columnofs[x1]
+            count = x2 - x1
+            while count >= 0:
+                spot = ((xfrac >> 16) & 63) | ((yfrac >> 10) & 0x0FC0)
+                fb[dest] = cm[flat[spot] if spot < flat_len else 0]
+                dest += 1
+                xfrac = as_i32(xfrac + xstep)
+                yfrac = as_i32(yfrac + ystep)
+                count -= 1
+
     def _draw_planes(self) -> None:
-        """R_DrawPlanes + R_MapPlane (r_plane.prg)."""
+        """R_DrawPlanes via R_MakeSpans + R_MapPlane (Harbour r_plane.prg)."""
         for pl in self.visplanes:
             if pl.minx > pl.maxx:
                 continue
@@ -896,36 +1084,15 @@ class Renderer:
                         self._draw_column()
                 continue
             light = max(0, min(LIGHTLEVELS - 1, (pl.lightlevel >> 4) + self.extralight))
-            planezlight = self.zlight[light]
-            flat = self.res.flat_pixels(pl.picnum)
-            planeheight = abs_fixed(pl.height - self.viewz)
-            if planeheight == 0:
+            self.planezlight = self.zlight[light]
+            self.ds_source = self.res.flat_pixels(pl.picnum)
+            self.planeheight = abs_fixed(pl.height - self.viewz)
+            if self.planeheight == 0:
                 continue
-            cached_y = -1
-            distance = ds_xstep = ds_ystep = 0
-            for x in range(max(0, pl.minx), min(self.viewwidth, pl.maxx + 1)):
-                t1, b1 = pl.top[x], pl.bottom[x]
-                if t1 > b1 or t1 == 0xFF:
-                    continue
-                for y in range(t1, min(b1, self.viewheight - 1) + 1):
-                    if y != cached_y:
-                        cached_y = y
-                        distance = fixed_mul(planeheight, self.yslope[y])
-                        ds_xstep = fixed_mul(distance, self.basexscale)
-                        ds_ystep = fixed_mul(distance, self.baseyscale)
-                    length = fixed_mul(distance, self.distscale[x])
-                    ang = ushr(as_u32(self.viewangle + self.xtoviewangle[x]), ANGLETOFINESHIFT) & FINEMASK
-                    ds_xfrac = self.viewx + fixed_mul(finesine[(ang + FINEANGLES // 4) & FINEMASK], length)
-                    ds_yfrac = -self.viewy - fixed_mul(finesine[ang], length)
-                    index = min(MAXLIGHTZ - 1, ushr(distance, LIGHTZSHIFT))
-                    cm = self.fixedcolormap or self.res.colormap(planezlight[index])
-                    # R_DrawSpan: xtemp = xfrac>>16, ytemp = (yfrac>>10)&0x0FC0
-                    spot = ((ds_xfrac >> 16) & 63) | ((ds_yfrac >> 10) & 0x0FC0)
-                    pix = cm[flat[spot] if spot < len(flat) else 0]
-                    if self.detailshift:
-                        xx = x << 1
-                        off = self.ylookup[y] + self.columnofs[xx]
-                        self.fb[off] = pix
-                        self.fb[off + 1] = pix
-                    else:
-                        self.fb[self.ylookup[y] + self.columnofs[x]] = pix
+            stop = pl.maxx + 1
+            for x in range(pl.minx, stop + 1):
+                t1 = self._plane_top(pl, x - 1)
+                b1 = self._plane_bottom(pl, x - 1)
+                t2 = self._plane_top(pl, x)
+                b2 = self._plane_bottom(pl, x)
+                self._make_spans(x, t1, b1, t2, b2)

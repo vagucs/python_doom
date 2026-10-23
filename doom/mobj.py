@@ -35,6 +35,7 @@ from .defs import (
     MF_AMBUSH,
     MF_COUNTITEM,
     MF_COUNTKILL,
+    MF_DROPPED,
     MF_FLOAT,
     MF_NOBLOCKMAP,
     MF_NOGRAVITY,
@@ -53,6 +54,7 @@ from .defs import (
     SK_BABY,
     SK_EASY,
     SK_HARD,
+    SK_MEDIUM,
     SK_NIGHTMARE,
     MTF_AMBUSH,
     WP_BFG,
@@ -248,16 +250,57 @@ def spawn_map_things(world, skill: int, game=None) -> tuple[int, int]:
     return totalkills, totalitems
 
 
-def give_ammo(player, ammo: int, num: int) -> bool:
+def give_ammo(player, ammo: int, num: int, game=None) -> bool:
+    """P_GiveAmmo — Harbour: num is clip count (0 = half clip); baby/nightmare doubles."""
+    from .defs import (
+        AM_CELL,
+        AM_CLIP,
+        AM_MISL,
+        AM_SHELL,
+        SK_BABY,
+        SK_NIGHTMARE,
+        WP_CHAINGUN,
+        WP_FIST,
+        WP_MISSILE,
+        WP_PISTOL,
+        WP_PLASMA,
+        WP_SHOTGUN,
+    )
+
+    if ammo < 0 or ammo > 3:
+        return False
     if player.ammo[ammo] >= player.maxammo[ammo]:
         return False
-    player.ammo[ammo] = min(player.maxammo[ammo], player.ammo[ammo] + CLIPAMMO[ammo] * num)
+    old = player.ammo[ammo]
+    if num != 0:
+        add = CLIPAMMO[ammo] * num
+    else:
+        add = CLIPAMMO[ammo] // 2
+    skill = getattr(game, "skill", SK_MEDIUM) if game is not None else SK_MEDIUM
+    if skill in (SK_BABY, SK_NIGHTMARE):
+        add *= 2
+    player.ammo[ammo] = min(player.maxammo[ammo], player.ammo[ammo] + add)
+    if old != 0:
+        return True
+    # Prefers a matching gun when ammo was empty (vanilla P_GiveAmmo).
+    if ammo == AM_CLIP and player.readyweapon == WP_FIST:
+        player.pendingweapon = WP_CHAINGUN if player.weaponowned[WP_CHAINGUN] else WP_PISTOL
+    elif ammo == AM_SHELL and player.readyweapon in (WP_FIST, WP_PISTOL) and player.weaponowned[WP_SHOTGUN]:
+        player.pendingweapon = WP_SHOTGUN
+    elif ammo == AM_CELL and player.readyweapon in (WP_FIST, WP_PISTOL) and player.weaponowned[WP_PLASMA]:
+        player.pendingweapon = WP_PLASMA
+    elif ammo == AM_MISL and player.readyweapon == WP_FIST and player.weaponowned[WP_MISSILE]:
+        player.pendingweapon = WP_MISSILE
     return True
 
 
 def touch_special(game, special: Mobj, toucher: Mobj) -> None:
+    # P_TouchSpecialThing: reject if special is too high/low relative to toucher.
+    delta = special.z - toucher.z
+    if delta > toucher.height or delta < -8 * FRACUNIT:
+        return
     player = toucher.player
-    if player is None or not special.alive:
+    if player is None or not special.alive or toucher.health <= 0:
         return
     pickup = INFO.get(getattr(special, "doomednum", special.type))
     if special.info and special.info[0] not in (None, ""):
@@ -313,29 +356,38 @@ def touch_special(game, special: Mobj, toucher: Mobj) -> None:
         player.cards[int(extra)] = True
         player.set_message(KEY_NAMES.get(int(extra), "You picked up a key."))
     elif kind == "weapon":
+        # P_GiveWeapon: placed guns give 2 clips; MF_DROPPED gives 1 (Harbour).
         w = int(extra)
-        player.weaponowned[w] = True
-        if player.readyweapon != w:
+        clips = 1 if (special.flags & MF_DROPPED) else 2
+        ammo_map = {
+            WP_SHOTGUN: AM_SHELL,
+            WP_SUPERSHOTGUN: AM_SHELL,
+            WP_CHAINGUN: AM_CLIP,
+            WP_MISSILE: AM_MISL,
+            WP_PLASMA: AM_CELL,
+            WP_BFG: AM_CELL,
+        }
+        gave_ammo = False
+        if w in ammo_map:
+            gave_ammo = give_ammo(player, ammo_map[w], clips, game)
+        gave_weapon = False
+        if not player.weaponowned[w]:
+            gave_weapon = True
+            player.weaponowned[w] = True
             player.pendingweapon = w
-        if w in (WP_SHOTGUN, WP_SUPERSHOTGUN):
-            give_ammo(player, AM_SHELL, 1)
-        elif w == WP_CHAINGUN:
-            give_ammo(player, AM_CLIP, 1)
-        elif w == WP_MISSILE:
-            give_ammo(player, AM_MISL, 1)
-        elif w in (WP_PLASMA, WP_BFG):
-            give_ammo(player, AM_CELL, 1)
-        player.set_message(WEAPON_NAMES.get(w, "You got a weapon!"))
-        game.start_sound("wpnup")
+        taken = gave_weapon or gave_ammo
+        if taken:
+            player.set_message(WEAPON_NAMES.get(w, "You got a weapon!"))
+            game.start_sound("wpnup")
     elif kind == "ammo":
         ammo, num = extra
-        taken = give_ammo(player, ammo, num)
+        taken = give_ammo(player, ammo, num, game)
         if taken:
             player.set_message("Picked up some ammo.")
     elif kind == "backpack":
         for i in range(4):
             player.maxammo[i] = player.maxammo[i] * 2 if player.maxammo[i] < 400 else player.maxammo[i]
-            give_ammo(player, i, 1)
+            give_ammo(player, i, 1, game)
         player.set_message("You picked up a backpack full of ammo!")
     elif kind == "item":
         powers = {
@@ -364,5 +416,8 @@ def touch_special(game, special: Mobj, toucher: Mobj) -> None:
             player.itemcount += 1
         special.alive = False
         special.flags = 0
-        if special in game.world.mobjs:
-            game.world.mobjs.remove(special)
+        mobjs = game.world.mobjs
+        for i, m in enumerate(mobjs):
+            if m is special:
+                del mobjs[i]
+                break

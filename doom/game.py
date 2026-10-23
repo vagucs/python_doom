@@ -22,6 +22,7 @@ import pygame
 from .collision import angle_to, point_in_subsector
 from .compat import as_u32, fixed_mul
 from .defs import (
+    AM_MISL,
     ANG90,
     ANG180,
     BT_ATTACK,
@@ -35,6 +36,7 @@ from .defs import (
     GS_INTERMISSION,
     GS_LEVEL,
     GS_TITLE,
+    MF_COUNTKILL,
     MF_JUSTHIT,
     MF_NOCLIP,
     MF_SKULLFLY,
@@ -43,6 +45,7 @@ from .defs import (
     PST_DEAD,
     PST_LIVE,
     PST_REBORN,
+    PW_INVULNERABILITY,
     PW_IRONFEET,
     PW_STRENGTH,
     RADIATIONPAL,
@@ -67,7 +70,7 @@ from .defs import (
 from .am_map import Automap
 from .config import load as load_defaults, save as save_defaults
 from .deh import deh
-from .enemy import kill_monster, p_random, tick_enemies
+from .enemy import kill_monster, p_random, rng_index, tick_enemies
 from .finale import Finale, commercial_finale_map
 from .menu import Menu
 from .mobj import spawn_map_things, touch_special
@@ -138,6 +141,7 @@ def find_iwad(explicit: str | None = None) -> str:
 
 class Game:
     DEMOMARKER = 0x80
+    DOOM_191_VERSION = 111
 
     def __init__(self) -> None:
         self.wad = Wad()
@@ -167,6 +171,7 @@ class Game:
         self.crt = False
         self.title_patch: bytes | None = None
         self.credit_patch: bytes | None = None
+        self.help2_patch: bytes | None = None
         self.page_patch: bytes | None = None
         self.page_tic = 0
         self.demo_sequence = -1
@@ -176,6 +181,7 @@ class Game:
         self.demo_buffer: bytes | bytearray | None = None
         self.demo_p = 0
         self.demo_name = ""
+        self.longtics = False
         self.singledemo = False
         self.timingdemo = False
         self.timedemo_start = 0
@@ -204,7 +210,7 @@ class Game:
         self.wi: Intermission | None = None
         self.finale: Finale | None = None
         self.wipe = Wipe()
-        self.wipegamestate: int | None = GS_TITLE
+        self.wipegamestate: int = GS_TITLE
         self.wiping = False
         self.force_wipe = False
         self.next_mapn = 1
@@ -230,8 +236,13 @@ class Game:
             self.specials.shoot_special(line, thing)
 
     def damage_mobj(self, target, source, damage: int, inflictor=None) -> None:
+        """P_DamageMobj — Harbour p_inter.prg."""
         if not target.alive or not (target.flags & MF_SHOOTABLE):
             return
+        if target.health <= 0:
+            return
+        if target.flags & MF_SKULLFLY:
+            target.momx = target.momy = target.momz = 0
         if target.player and self.skill == SK_BABY:
             damage >>= 1
         src = inflictor if inflictor is not None else source
@@ -258,40 +269,55 @@ class Game:
             target.momy += fixed_mul(thrust, fine_sin(ang))
         if target.player:
             player = target.player
-            if ((player.cheats & CF_GODMODE) or player.powers[0]) and damage < 1000:
+            # Hell hack (sector special 11).
+            sec = getattr(getattr(target, "subsector", None), "sector", None)
+            if sec is None and self.world is not None:
+                from .collision import point_in_subsector
+
+                sec = point_in_subsector(self.world, target.x, target.y).sector
+            if sec is not None and sec.special == 11 and damage >= target.health:
+                damage = target.health - 1
+            if ((player.cheats & CF_GODMODE) or player.powers[PW_INVULNERABILITY]) and damage < 1000:
                 return
-            saved = 0
             if player.armortype:
-                saved = damage // (player.armortype == 1 and 3 or 2)
+                saved = damage // (3 if player.armortype == 1 else 2)
                 if player.armorpoints <= saved:
                     saved = player.armorpoints
                     player.armortype = 0
                 player.armorpoints -= saved
-            damage -= saved
+                damage -= saved
             player.health -= damage
-            target.health = player.health
+            if player.health < 0:
+                player.health = 0
+            player.attacker = source
             player.damagecount += damage
             if player.damagecount > 100:
                 player.damagecount = 100
-            player.attacker = source
-            if player.health <= 0:
-                player.health = 0
-                player.playerstate = PST_DEAD
-                target.alive = False
-                target.flags &= ~(MF_SOLID | MF_SHOOTABLE)
-                self.start_sound("pldeth")
-            else:
-                self.start_sound("plpain")
-                self._pain_or_wake(target, source)
-            return
+        # Harbour always subtracts target.health (player.health already mirrored above).
         target.health -= damage
+        if target.player is not None:
+            target.health = target.player.health
         if target.health <= 0:
+            if target.player is not None:
+                target.player.playerstate = PST_DEAD
+                target.flags &= ~MF_SOLID
+                self.start_sound("pldeth")
             kill_monster(target, self, source)
             return
+        if target.player is not None:
+            self.start_sound("plpain")
         self._pain_or_wake(target, source)
 
     def _pain_or_wake(self, target, source) -> None:
-        from .info import MI_PAINCHANCE, MI_PAINSTATE, MI_SEESTATE, MI_SPAWNSTATE, MOBJINFO
+        """P_DamageMobj pain/wake tail — match PHP painOrWake / vanilla threshold."""
+        from .info import (
+            MI_PAINCHANCE,
+            MI_PAINSTATE,
+            MI_SEESTATE,
+            MI_SPAWNSTATE,
+            MOBJINFO,
+            MT_VILE,
+        )
         from .thinker import set_mobj_state
 
         info = MOBJINFO[target.type]
@@ -300,8 +326,16 @@ class Game:
             if info[MI_PAINSTATE]:
                 set_mobj_state(target, info[MI_PAINSTATE], self.world, self)
         target.reactiontime = 0
-        if source is not None and source is not target and target.player is None:
+        if (
+            source is not None
+            and source is not target
+            and target.player is None
+            and (target.threshold == 0 or target.type == MT_VILE)
+            and getattr(source, "type", None) != MT_VILE
+        ):
             target.target = source
+            target.threshold = 100  # BASETHRESHOLD
+            # p_inter.c: only spawnstate (not spawnstate+1).
             if target.istate == info[MI_SPAWNSTATE] and info[MI_SEESTATE]:
                 set_mobj_state(target, info[MI_SEESTATE], self.world, self)
 
@@ -313,9 +347,11 @@ class Game:
         clear_random()
         self.world = World()
         self.world.setup_level(self.wad, self.res, self.episode, self.mapn)
-        self.specials = Specials(self.world, self.res, self.sound)
+        self.specials = Specials(self.world, self.res, self.sound, self)
         self.player = None
+        # Things before specials (vanilla P_LoadThings → P_SpawnSpecials) so P_Random matches.
         self.totalkills, self.totalitems = spawn_map_things(self.world, self.skill, self)
+        self.specials.spawn_specials()
         if self.player is None:
             raise RuntimeError("no player 1 start")
         if prev is not None:
@@ -328,6 +364,9 @@ class Game:
 
         apply_fast(self)
         self.leveltime = 0
+        # Harbour G_DoLoadLevel: force melt when reloading while already in a level.
+        if self.wipegamestate == GS_LEVEL:
+            self.wipegamestate = -1
         self.gamestate = GS_LEVEL
         self.specials.exit_requested = False
         self.specials.secret_exit = False
@@ -363,6 +402,9 @@ class Game:
 
     def _commercial(self) -> bool:
         return self.wad.check_num_for_name("MAP01") >= 0
+
+    def _shareware(self) -> bool:
+        return (not self._commercial()) and self.wad.check_num_for_name("E2M1") < 0
 
     def complete_level(self) -> None:
         self.automap.stop()
@@ -530,11 +572,18 @@ class Game:
                 self.advancedemo = True
                 self.do_advance_demo()
         elif self.demo_sequence == 4:
-            self.page_tic = TICRATE * 11 if self._commercial() else 200
+            # Harbour D_DoAdvanceDemo: commercial TITLEPIC; retail CREDIT; shareware HELP2.
             self.gamestate = GS_TITLE
-            self.page_patch = self.title_patch
             if self._commercial():
+                self.page_tic = TICRATE * 11
+                self.page_patch = self.title_patch
                 self.sound.play_title_music()
+            else:
+                self.page_tic = 200
+                if self._shareware():
+                    self.page_patch = self.help2_patch or self.credit_patch or self.title_patch
+                else:
+                    self.page_patch = self.credit_patch or self.title_patch
         else:
             if not self.play_demo("demo3"):
                 self.advancedemo = True
@@ -542,24 +591,39 @@ class Game:
 
     def play_demo(self, name: str) -> bool:
         data = self._load_demo_bytes(name)
-        if data is None or len(data) < 13:
+        if data is None or len(data) < 4:
             return False
         self.demo_buffer = data
         self.demo_p = 0
         demo_version = data[self.demo_p]
         self.demo_p += 1
+        self.longtics = False
         if demo_version <= 4:
+            # Pre-1.4 demos: first byte is skill, not version.
             self.demo_p = 0
+        elif demo_version == Game.DOOM_191_VERSION:
+            self.longtics = True
+        if self.demo_p + 3 > len(data):
+            return False
         demo_skill = data[self.demo_p]
         self.demo_p += 1
         demo_episode = data[self.demo_p]
         self.demo_p += 1
         demo_map = data[self.demo_p]
         self.demo_p += 1
-        self.demo_p += 5
-        self.demo_p += 4
-        if demo_skill <= 4:
-            self.skill = demo_skill
+        if demo_version > 4:
+            if self.demo_p + 9 > len(data):
+                return False
+            self.demo_p += 1  # mode
+            self.respawnparm = data[self.demo_p] != 0
+            self.demo_p += 1
+            self.fastparm = data[self.demo_p] != 0
+            self.demo_p += 1
+            self.nomonsters = data[self.demo_p] != 0
+            self.demo_p += 1
+            self.demo_p += 1  # consoleplayer
+            self.demo_p += 4  # playeringame
+        self.skill = max(0, min(SK_NIGHTMARE, demo_skill))
         if demo_episode >= 1:
             self.episode = demo_episode
         if demo_map >= 1:
@@ -594,6 +658,7 @@ class Game:
         buf.extend(b"\x01\x00\x00\x00")
         self.demo_buffer = buf
         self.demo_p = len(buf)
+        self.longtics = False
         self.demo_recording = True
 
     def write_demo_ticcmd(self, cmd: Ticcmd) -> None:
@@ -648,17 +713,25 @@ class Game:
 
     def read_demo_ticcmd(self) -> Ticcmd:
         cmd = Ticcmd()
+        need = 5 if self.longtics else 4
         if (
             self.demo_buffer is None
-            or self.demo_p + 4 > len(self.demo_buffer)
+            or self.demo_p + need > len(self.demo_buffer)
             or self.demo_buffer[self.demo_p] == Game.DEMOMARKER
         ):
             self.check_demo_status()
             return cmd
         cmd.forwardmove = self._demo_sbyte()
         cmd.sidemove = self._demo_sbyte()
-        cmd.angleturn = self.demo_buffer[self.demo_p] << 8
-        self.demo_p += 1
+        if self.longtics:
+            low = self.demo_buffer[self.demo_p]
+            self.demo_p += 1
+            high = self.demo_buffer[self.demo_p]
+            self.demo_p += 1
+            cmd.angleturn = low | (high << 8)
+        else:
+            cmd.angleturn = self.demo_buffer[self.demo_p] << 8
+            self.demo_p += 1
         if cmd.angleturn >= 32768:
             cmd.angleturn -= 65536
         cmd.buttons = self.demo_buffer[self.demo_p]
@@ -723,26 +796,29 @@ class Game:
                     cmd.buttons |= BT_CHANGE | (w << BT_WEAPONSHIFT)
                     break
         if self.use_mouse:
+            # Vanilla: FixedMul(mouse, sens+5) then clamp — approx as (mouse*(sens+5))/10.
             sens = (self.mouse_sensitivity + 5) / 10.0
             mx = int(self.mousex * sens)
             my = int(self.mousey * sens)
             cmd.forwardmove += my
-            if cmd.forwardmove > 127:
-                cmd.forwardmove = 127
-            if cmd.forwardmove < -127:
-                cmd.forwardmove = -127
             if strafe:
                 cmd.sidemove += mx * 2
-                if cmd.sidemove > 127:
-                    cmd.sidemove = 127
-                if cmd.sidemove < -127:
-                    cmd.sidemove = -127
             else:
                 cmd.angleturn -= mx * 8
             if self.mouse_fire:
                 cmd.buttons |= BT_ATTACK
             self.mousex = 0
             self.mousey = 0
+        # MAXPLMOVE = forwardmove[1] (0x32). Cap >50 is turbo and desyncs feel vs Harbour/vanilla.
+        max_move = FORWARDMOVE[1]
+        if cmd.forwardmove > max_move:
+            cmd.forwardmove = max_move
+        elif cmd.forwardmove < -max_move:
+            cmd.forwardmove = -max_move
+        if cmd.sidemove > max_move:
+            cmd.sidemove = max_move
+        elif cmd.sidemove < -max_move:
+            cmd.sidemove = -max_move
         return cmd
 
     def run_tic(self) -> None:
@@ -780,6 +856,9 @@ class Game:
             return
         if self.demo_playback:
             self.player.cmd = self.read_demo_ticcmd()
+            # DEMOMARKER / EOF: check_demo_status already advanced the title loop.
+            if not self.demo_playback:
+                return
         elif self.menu and self.menu.active:
             self.player.cmd = Ticcmd()
         else:
@@ -790,17 +869,58 @@ class Game:
         if self.player.playerstate == PST_REBORN:
             self.load_level(False)
             return
-        tick_enemies(self.world, self)
+        # Thinker order ≈ vanilla: map mobjs → lights (SpawnSpecials) → missiles → doors/plats.
+        tick_enemies(self.world, self, False)
+        if self.specials:
+            self.specials.tick_lights_early()
+        tick_enemies(self.world, self, True)
         if self.specials:
             self.specials.tick()
             if self.specials.exit_requested:
                 self.start_sound("swtchx")
                 self.complete_level()
                 return
+        if self.demo_playback:
+            self._sync_demo1_log()
         self.leveltime += 1
         self.automap.ticker(self)
         if self.status:
             self.status.ticker(self.player)
+
+    @staticmethod
+    def _map_unit(v: int) -> int:
+        """Harbour Int(x/65536) / PHP intdiv: truncate toward zero (not Python //)."""
+        return v // 65536 if v >= 0 else -((-v) // 65536)
+
+    def _sync_demo1_log(self) -> None:
+        """Same fields as harbour_doom/sync_demo1.log for offline compare."""
+        mo = self.player.mo if self.player else None
+        if mo is None or self.world is None:
+            return
+        n = 0
+        sx = 0
+        mu = self._map_unit
+        for m in self.world.mobjs:
+            if (m.flags & MF_COUNTKILL) and m.health > 0:
+                n += 1
+                sx += mu(m.x)
+        path = getattr(self, "_sync_log_path", None)
+        if path is None:
+            demo = (self.timedemo_name or self.playdemo_name or "demo1").lower()
+            path = os.path.join(os.path.dirname(__file__), "..", f"_sync_{demo}.log")
+            self._sync_log_path = path
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("")
+        line = (
+            f"{self.leveltime} {self.player.health} {self.player.armorpoints}"
+            f" {mu(mo.x)} {mu(mo.y)}"
+            f" {mu(mo.z)} {mu(mo.floorz)}"
+            f" {mo.momx} {mo.momy} {mo.angle}"
+            f" {n} {sx} {rng_index()}"
+            f" {self.player.readyweapon} {self.player.ammo[AM_MISL]}\n"
+        )
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
 
     def draw(self) -> None:
         fb = self.video.fb
@@ -810,8 +930,13 @@ class Game:
             self._apply_palette()
             self.video.present()
             return
+        # Harbour D_Display: wipe on gamestate change (also during demos). Skipping
+        # wipe while demo_playback left wipegamestate stale and caused a fake
+        # death→death melt when the demo ended before D_DoAdvanceDemo.
         need_wipe = self.force_wipe or self.gamestate != self.wipegamestate
         self.force_wipe = False
+        if need_wipe and self.advancedemo and self.gamestate == GS_LEVEL:
+            need_wipe = False
         if need_wipe:
             self.wipe.capture_start(fb)
         self._draw_frame(fb)
@@ -1245,6 +1370,8 @@ def main(argv: list[str] | None = None) -> int:
         game.title_patch = game.wad.cache_lump_name("TITLEPIC")
     if game.wad.check_num_for_name("CREDIT") >= 0:
         game.credit_patch = game.wad.cache_lump_name("CREDIT")
+    if game.wad.check_num_for_name("HELP2") >= 0:
+        game.help2_patch = game.wad.cache_lump_name("HELP2")
     game.page_patch = game.title_patch
     game.status = StatusBar(game.wad)
     if game.record_name:
@@ -1268,6 +1395,8 @@ def main(argv: list[str] | None = None) -> int:
         game.start_title()
 
     tick_ms = 1000 / TICRATE
+    # Cap catch-up so a slow frame cannot pile dozens of tics (ESC / input starve).
+    max_tics = 5
     accum = 0.0
     last = pygame.time.get_ticks()
     while game.running:
@@ -1279,9 +1408,13 @@ def main(argv: list[str] | None = None) -> int:
         if game.timingdemo:
             game.run_tic()
         else:
-            while accum >= tick_ms:
+            n = 0
+            while accum >= tick_ms and n < max_tics:
                 game.run_tic()
                 accum -= tick_ms
+                n += 1
+            if accum > tick_ms * max_tics:
+                accum = 0.0
         game.draw()
     if game.demo_recording:
         game.finish_recording()

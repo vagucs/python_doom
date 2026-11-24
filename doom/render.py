@@ -461,11 +461,10 @@ class Renderer:
         if sx1 == sx2:
             return False
         sx2 -= 1
+        # Harbour: walk sentinel (last=+∞); do not early-out on newend.
         start = 0
-        while start < self.newend and self.solidsegs[start].last < sx2:
+        while self.solidsegs[start].last < sx2:
             start += 1
-        if start >= self.newend:
-            return True
         if sx1 >= self.solidsegs[start].first and sx2 <= self.solidsegs[start].last:
             return False
         return True
@@ -480,11 +479,25 @@ class Renderer:
         light = (self.frontsector.lightlevel >> 4) + self.extralight
         light = max(0, min(LIGHTLEVELS - 1, light))
         self.walllights = self.scalelight[light]
-        self.floorplane = self._find_plane(
-            self.frontsector.floorheight, self.frontsector.floorpic, self.frontsector.lightlevel
+        # Harbour R_Subsector: no plane on the wrong side of viewz.
+        self.floorplane = (
+            self._find_plane(
+                self.frontsector.floorheight, self.frontsector.floorpic, self.frontsector.lightlevel
+            )
+            if self.frontsector.floorheight < self.viewz
+            else None
         )
-        self.ceilingplane = self._find_plane(
-            self.frontsector.ceilingheight, self.frontsector.ceilingpic, self.frontsector.lightlevel
+        self.ceilingplane = (
+            self._find_plane(
+                self.frontsector.ceilingheight,
+                self.frontsector.ceilingpic,
+                self.frontsector.lightlevel,
+            )
+            if (
+                self.frontsector.ceilingheight > self.viewz
+                or self.frontsector.ceilingpic == self.res.skyflatnum
+            )
+            else None
         )
         line = sub.firstline
         for _ in range(sub.numlines):
@@ -519,26 +532,39 @@ class Renderer:
         if x1 == x2:
             return
         self.backsector = line.backsector
+        # Harbour R_AddLine clipsolid logic (incl. identical empty trigger skip).
+        clipsolid = False
         if self.backsector is None:
-            self._clip_solid(x1, x2 - 1)
-            return
-        if (
+            clipsolid = True
+        elif (
             self.backsector.ceilingheight <= self.frontsector.floorheight
             or self.backsector.floorheight >= self.frontsector.ceilingheight
         ):
-            self._clip_solid(x1, x2 - 1)
+            clipsolid = True
+        elif (
+            self.backsector.ceilingheight != self.frontsector.ceilingheight
+            or self.backsector.floorheight != self.frontsector.floorheight
+        ):
+            clipsolid = False
+        elif (
+            self.backsector.ceilingpic == self.frontsector.ceilingpic
+            and self.backsector.floorpic == self.frontsector.floorpic
+            and self.backsector.lightlevel == self.frontsector.lightlevel
+            and (line.sidedef.midtexture if line.sidedef else 0) == 0
+        ):
             return
-        self._clip_pass(x1, x2 - 1)
+        if clipsolid:
+            self._clip_solid(x1, x2 - 1)
+        else:
+            self._clip_pass(x1, x2 - 1)
 
     def _clip_solid(self, first: int, last: int) -> None:
         if first > last:
             return
+        # Harbour: walk sentinel — do not early-out on newend.
         start = 0
-        while start < self.newend and self.solidsegs[start].last < first - 1:
+        while self.solidsegs[start].last < first - 1:
             start += 1
-        if start >= self.newend:
-            self._store_wall_range(first, last)
-            return
         if first < self.solidsegs[start].first:
             if last < self.solidsegs[start].first - 1:
                 self._store_wall_range(first, last)
@@ -552,7 +578,7 @@ class Renderer:
         if last <= self.solidsegs[start].last:
             return
         nexti = start
-        while nexti + 1 < self.newend and last >= self.solidsegs[nexti + 1].first - 1:
+        while last >= self.solidsegs[nexti + 1].first - 1:
             self._store_wall_range(self.solidsegs[nexti].last + 1, self.solidsegs[nexti + 1].first - 1)
             nexti += 1
             if last <= self.solidsegs[nexti].last:
@@ -576,12 +602,10 @@ class Renderer:
     def _clip_pass(self, first: int, last: int) -> None:
         if first > last:
             return
+        # Harbour: walk sentinel — do not early-out on newend.
         start = 0
-        while start < self.newend and self.solidsegs[start].last < first - 1:
+        while self.solidsegs[start].last < first - 1:
             start += 1
-        if start >= self.newend:
-            self._store_wall_range(first, last)
-            return
         if first < self.solidsegs[start].first:
             if last < self.solidsegs[start].first - 1:
                 self._store_wall_range(first, last)
@@ -590,7 +614,7 @@ class Renderer:
         if last <= self.solidsegs[start].last:
             return
         nexti = start
-        while nexti + 1 < self.newend and last >= self.solidsegs[nexti + 1].first - 1:
+        while last >= self.solidsegs[nexti + 1].first - 1:
             self._store_wall_range(self.solidsegs[nexti].last + 1, self.solidsegs[nexti + 1].first - 1)
             nexti += 1
             if last <= self.solidsegs[nexti].last:
@@ -694,9 +718,9 @@ class Renderer:
             self.markfloor = False
         if self.frontsector.ceilingheight <= self.viewz and self.frontsector.ceilingpic != self.res.skyflatnum:
             self.markceiling = False
-        if self.markceiling:
+        if self.markceiling and self.ceilingplane is not None:
             self.ceilingplane = self._check_plane(self.ceilingplane, start, stop)
-        if self.markfloor:
+        if self.markfloor and self.floorplane is not None:
             self.floorplane = self._check_plane(self.floorplane, start, stop)
         self.worldtop >>= 4
         self.worldbottom >>= 4
@@ -718,7 +742,7 @@ class Renderer:
         self._push_drawseg(start, stop, scale1)
 
     def _push_drawseg(self, start: int, stop: int, scale1: int) -> None:
-        """r_segs: fill a drawseg for R_DrawSprite clipping."""
+        """Harbour R_StoreWallRange: closed door keeps negone/screenheight; else post-loop clips."""
         ds = DrawSeg(
             x1=start,
             x2=stop,
@@ -728,15 +752,17 @@ class Renderer:
         )
         ds.scalestep = self.rw_scalestep
         ds.maskedtexturecol = self.maskedtexturecol
+        width = stop - start + 1
         if self.backsector is None:
             ds.silhouette = SIL_BOTH
             ds.bsilheight = INT_MAX
             ds.tsilheight = INT_MIN
-            width = stop - start + 1
             ds.sprtopclip = [self.viewheight] * width
             ds.sprbottomclip = [-1] * width
         else:
             ds.silhouette = SIL_NONE
+            top_clip = None
+            bot_clip = None
             if self.frontsector.floorheight > self.backsector.floorheight:
                 ds.silhouette = SIL_BOTTOM
                 ds.bsilheight = self.frontsector.floorheight
@@ -750,13 +776,17 @@ class Renderer:
                 ds.silhouette |= SIL_TOP
                 ds.tsilheight = INT_MIN
             if self.backsector.ceilingheight <= self.frontsector.floorheight:
-                ds.silhouette |= SIL_BOTTOM
+                bot_clip = [-1] * width
                 ds.bsilheight = INT_MAX
+                ds.silhouette |= SIL_BOTTOM
             if self.backsector.floorheight >= self.frontsector.ceilingheight:
-                ds.silhouette |= SIL_TOP
+                top_clip = [self.viewheight] * width
                 ds.tsilheight = INT_MIN
-            ds.sprtopclip = self.ceilingclip[start : stop + 1][:]
-            ds.sprbottomclip = self.floorclip[start : stop + 1][:]
+                ds.silhouette |= SIL_TOP
+            if ((ds.silhouette & SIL_TOP) or self.maskedtexture) and top_clip is None:
+                top_clip = self.ceilingclip[start : stop + 1][:]
+            if ((ds.silhouette & SIL_BOTTOM) or self.maskedtexture) and bot_clip is None:
+                bot_clip = self.floorclip[start : stop + 1][:]
             if self.maskedtexture:
                 if not (ds.silhouette & SIL_TOP):
                     ds.silhouette |= SIL_TOP
@@ -764,6 +794,8 @@ class Renderer:
                 if not (ds.silhouette & SIL_BOTTOM):
                     ds.silhouette |= SIL_BOTTOM
                     ds.bsilheight = INT_MAX
+            ds.sprtopclip = top_clip if top_clip is not None else [-1] * width
+            ds.sprbottomclip = bot_clip if bot_clip is not None else [self.viewheight] * width
         self.drawsegs.append(ds)
 
     def _point_to_dist(self, x: int, y: int) -> int:

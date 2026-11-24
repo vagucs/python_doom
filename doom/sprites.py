@@ -19,13 +19,16 @@ import sys
 from dataclasses import dataclass, field
 
 from .collision import point_in_subsector
-from .compat import as_i32, as_u32, fixed_div, fixed_mul
+from .compat import as_i32, as_u32, fixed_div, fixed_mul, ushr
 from .defs import (
     ANG45,
     FINEANGLES,
     FINEMASK,
     FRACBITS,
     FRACUNIT,
+    LIGHTLEVELS,
+    LIGHTSCALESHIFT,
+    MAXLIGHTSCALE,
     MF_NOSECTOR,
     MF_SHADOW,
     SCREENWIDTH,
@@ -33,6 +36,8 @@ from .defs import (
     SIL_TOP,
 )
 from .v_video import patch_size
+
+FF_FULLBRIGHT = 0x8000  # info.FF_FULLBRIGHT — avoid circular import
 
 BASEYCENTER = 100
 WEAPONTOP = 32 * FRACUNIT
@@ -163,7 +168,7 @@ def draw_sprites(renderer, world, fb: bytearray) -> None:
         sec = sub.sector if sub is not None else None
         if sec is None or sec.validcount != world.validcount:
             continue
-        item = _project(renderer, mo)
+        item = _project(renderer, world, mo)
         if item is not None:
             vis.append(item)
     vis.sort(key=lambda t: t["scale"])
@@ -171,7 +176,7 @@ def draw_sprites(renderer, world, fb: bytearray) -> None:
         _draw_sprite(renderer, fb, spr)
 
 
-def _project(renderer, mo) -> dict | None:
+def _project(renderer, world, mo) -> dict | None:
     tr_x = as_i32(mo.x - renderer.viewx)
     tr_y = as_i32(mo.y - renderer.viewy)
     gxt = fixed_mul(tr_x, renderer.viewcos)
@@ -210,8 +215,11 @@ def _project(renderer, mo) -> dict | None:
     vis_x2 = min(x2, renderer.viewwidth - 1)
     if vis_x1 > x1:
         startfrac += xiscale * (vis_x1 - x1)
+    # Harbour R_ProjectSprite: spritelights from thing's sector lightlevel.
+    sector = (getattr(mo, "subsector", None) or point_in_subsector(world, mo.x, mo.y)).sector
     return {
         "mo": mo,
+        "lightlevel": sector.lightlevel if sector is not None else None,
         "patch": patch,
         "w": w,
         "scale": xscale << renderer.detailshift,
@@ -225,6 +233,28 @@ def _project(renderer, mo) -> dict | None:
         "xiscale": xiscale,
         "startfrac": startfrac,
     }
+
+
+def _sprite_colormap(renderer, spr: dict):
+    """Harbour R_ProjectSprite colormap: fixed / fullbright / scalelight[sector][scale]."""
+    if renderer.fixedcolormap is not None:
+        return renderer.fixedcolormap
+    mo = spr.get("mo")
+    fullbright = spr.get("fullbright", False) or (
+        mo is not None and (getattr(mo, "frame", 0) & FF_FULLBRIGHT)
+    )
+    lightlevel = spr.get("lightlevel")
+    if fullbright or lightlevel is None:
+        return renderer.res.colormap(0)
+    lightnum = (lightlevel >> 4) + renderer.extralight
+    lightnum = max(0, min(LIGHTLEVELS - 1, lightnum))
+    if mo is not None:
+        index = ushr(spr["scale"], LIGHTSCALESHIFT)
+        index = min(MAXLIGHTSCALE - 1, index)
+    else:
+        index = MAXLIGHTSCALE - 1
+    level = renderer.scalelight[lightnum][index]
+    return renderer.res.colormap(level)
 
 
 def ushr_29(n: int) -> int:
@@ -371,10 +401,7 @@ def _draw_sprite(renderer, fb, spr, clip_walls: bool = True) -> None:
     colofs = [struct.unpack_from("<I", patch, 8 + c * 4)[0] for c in range(max(1, patch_w))]
     mo = spr.get("mo")
     fuzz = mo is not None and (getattr(mo, "flags", 0) & MF_SHADOW)
-    if fuzz:
-        cm = renderer.res.colormap(6)
-    else:
-        cm = renderer.fixedcolormap or renderer.res.colormap(0)
+    cm = renderer.res.colormap(6) if fuzz else _sprite_colormap(renderer, spr)
     ylookup = renderer.ylookup
     frac = spr["startfrac"]
     for x in range(spr["x1"], spr["x2"] + 1):

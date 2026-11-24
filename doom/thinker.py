@@ -153,6 +153,7 @@ def mobj_thinker(world, mo, game) -> None:
     """P_MobjThinker."""
     from . import enemy as en
 
+
     if mo.momx or mo.momy or (mo.flags & MF_SKULLFLY):
         en.p_xy_movement(world, mo, game)
         if not mo.alive:

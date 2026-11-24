@@ -382,15 +382,16 @@ def _death_think(world, player: Player, game, leveltime: int) -> None:
     if player.attacker is not None and player.attacker is not mo:
         angle = angle_to(mo.x, mo.y, player.attacker.x, player.attacker.y)
         delta = as_u32(angle - mo.angle)
-        ang5 = ANG90 // 18
-        if delta < as_u32(ang5) or delta > as_u32(-ang5):
+        # Harbour ANG5 = (ANG90/18) is float division; AsU32 truncates toward zero.
+        ang5 = ANG90 / 18
+        if delta < ang5 or delta > as_u32(int(0 - ang5)):
             mo.angle = angle
             if player.damagecount:
                 player.damagecount -= 1
         elif delta < as_u32(ANG180):
-            mo.angle = as_u32(mo.angle + ang5)
+            mo.angle = as_u32(int(mo.angle + ang5))
         else:
-            mo.angle = as_u32(mo.angle - ang5)
+            mo.angle = as_u32(int(mo.angle - ang5))
     elif player.damagecount:
         player.damagecount -= 1
     _weapon_think(player, game)
@@ -659,7 +660,7 @@ def _weapon_ready_bob(player: Player, game) -> None:
     lt = int(getattr(game, "leveltime", 0) or 0)
     angle = (128 * lt) & FINEMASK
     angle &= FINEANGLES // 2 - 1
-    player.psprite_sy = WEAPONTOP + fixed_mul(player.bob or 0, finesine[angle])
+    player.psprite_sy = WEAPONTOP + fixed_mul(player.bob or 0, finesine[angle] if finesine else 0)
 
 
 def _weapon_think(player: Player, game) -> None:

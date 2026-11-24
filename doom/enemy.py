@@ -293,7 +293,7 @@ def _recursive_sound(world, sec, soundblocks: int, target) -> None:
 
 def _look(world, mo, player_mo, game) -> None:
     """A_Look: idle until the player is in front (or a gunshot reaches this sector)."""
-    from .collision import point_in_subsector
+    from .collision import check_sight, point_in_subsector
     from .thinker import set_mobj_state
 
     mo.threshold = getattr(mo, "threshold", 0)
@@ -540,10 +540,6 @@ def _do_attack(world, mo, game) -> None:
             game.start_sound("skeatk")
             miss = spawn_missile_mt(world, mo, mo.target, MT_TRACER, game)
             miss.tracer = mo.target
-    elif kind == "mancubus":
-        game.start_sound("firsht")
-        for da in (-FATSPREAD, 0, FATSPREAD):
-            spawn_missile_mt(world, mo, mo.target, MT_FATSHOT, game, ang=as_u32(mo.angle + da))
     elif kind == "pain":
         game.start_sound("sklatk")
         _pain_shoot_skull(world, mo, game, mo.angle)
@@ -806,12 +802,12 @@ def p_xy_movement(world, mo, game) -> None:
     xmove, ymove = mo.momx, mo.momy
     half = MAXMOVE // 2
     while xmove != 0 or ymove != 0:
-        # Vanilla: step uses C `/2` (toward zero); remainder uses `>>= 1` (arithmetic).
+        # Harbour P_XYMovement: Int(xmove/2) for both step and remainder (toward zero).
         if xmove > half or ymove > half:
             ptryx = mo.x + _trunc2(xmove)
             ptryy = mo.y + _trunc2(ymove)
-            xmove = as_i32(xmove) >> 1
-            ymove = as_i32(ymove) >> 1
+            xmove = _trunc2(xmove)
+            ymove = _trunc2(ymove)
         else:
             ptryx = mo.x + xmove
             ptryy = mo.y + ymove
